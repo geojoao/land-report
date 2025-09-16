@@ -1,0 +1,26 @@
+[project]
+name = "bacen-report-app"
+version = "0.1.0"
+description = "A Dockerized application to generate BACEN reports from SICOR data."
+requires-python = "==3.10.*"
+dependencies = [
+    "setuptools",
+    "geopandas",
+    "requests",
+    "pandas",
+    "matplotlib",
+    "contextily",
+    "SQLAlchemy",
+    "pystac-client",
+    "shapely",
+    "wtss", # Web Time Series Service client
+    "wcpms @ git+https://github.com/brazil-data-cube/wcpms.py.git",
+    "scikit-image",
+    "kaleido",
+    "matplotlib-scalebar",
+    "rioxarray",
+    "pyproj",
+    "minisom",
+    "rasterio",
+    "scikit-learn"
+]
