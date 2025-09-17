@@ -26,4 +26,4 @@ COPY locks.xml .
 
 # Command to run the script when the container launches
 # Use the python interpreter from the virtual environment created by `uv sync`.
-CMD [".venv/bin/python", "bacen_report.py"]
+CMD [".venv/bin/python", "-u", "bacen_report.py"]

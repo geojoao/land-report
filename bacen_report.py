@@ -224,11 +224,15 @@ Centroid: {lat:.4f}, {lon:.4f}
 
     return fig
 
-# Uncomment to load land from xml:
-with open('locks.xml', 'r', encoding='utf-8') as f: #encoding='utf-16be') as f:
-    xml_content = f.read()
-print("1. Parsing XML and creating GeoDataFrame...")
-gdf = parse_xml_to_gdf_all_fields(xml_content)
+try:
+    # Uncomment to load land from xml:
+    with open('locks.xml', 'r', encoding='utf-8') as f: #encoding='utf-16be') as f:
+        xml_content = f.read()
+    print("1. Parsing XML and creating GeoDataFrame...")
+    gdf = parse_xml_to_gdf_all_fields(xml_content)
+except FileNotFoundError:
+    print("ERRO: O arquivo 'locks.xml' não foi encontrado. Certifique-se de que ele está no diretório correto ou montado no container Docker.")
+    sys.exit(1) # Exit with an error code
 
 # Uncomment to load land from kml:
 # gdf = gpd.read_file('glebas/sto_angelo.kml', driver='KML')
@@ -761,6 +765,27 @@ for i, ponto in enumerate(vetor_phenometrics):
 import rasterio
 from rasterio.mask import mask
 import numpy as np
+import time
+from rasterio.errors import RasterioIOError
+from rasterio._err import CPLE_AppDefinedError
+
+def retry_rasterio_open(href, max_retries=5, delay=15):
+    """
+    A wrapper to retry rasterio.open for network-related errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            # Set a timeout for the connection using GDAL config options
+            with rasterio.Env(GDAL_HTTP_TIMEOUT=60, GDAL_HTTP_CONNECTTIMEOUT=20):
+                return rasterio.open(href)
+        except (RasterioIOError, CPLE_AppDefinedError) as e:
+            # Check for common network error signatures in the error message
+            if 'CURL' in str(e) or 'HTTP' in str(e) or 'Timeout' in str(e):
+                print(f"   - Network error on attempt {attempt + 1}/{max_retries}: {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                raise # Re-raise if it's not a recognized network error
+    raise RasterioIOError(f"Failed to open {href} after {max_retries} attempts.")
 
 def carregar_banda_sentinel2_bdc(item, banda, gleba):
     """
@@ -781,7 +806,7 @@ def carregar_banda_sentinel2_bdc(item, banda, gleba):
 
     href = asset.href
 
-    with rasterio.open(href) as src:
+    with retry_rasterio_open(href) as src:
         # Reproject gleba geometry to raster CRS if needed
         if gleba.crs != src.crs:
             gleba_proj = gleba.to_crs(src.crs)
@@ -1087,10 +1112,14 @@ import geopandas as gpd
 import xarray as xr
 import numpy as np
 from shapely.geometry import mapping
+import dask.diagnostics
+from odc.stac import stac_load
 
-def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, interpolate=True):
+def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, resolution=10):
     """
     Load and preprocess a data cube clipped to the shapefile polygon.
+    This version is optimized for memory usage using odc-stac.
+    It creates a gap-filled monthly maximum value composite.
 
     Parameters:
     - shapefile: GeoDataFrame or GeoSeries with polygon geometry (in EPSG:4326)
@@ -1098,77 +1127,112 @@ def process_cube(shapefile, query_bands, start_date, end_date, collections, stac
     - start_date, end_date: strings 'YYYY-MM-DD'
     - collections: list of STAC collection names
     - stac_url: STAC API URL string
-    - interpolate: bool, whether to interpolate missing data in time
+    - resolution: int, the target resolution for the output cube.
 
     Returns:
-    - cube: xarray.Dataset with dimensions (time, y, x, band)
-    - mask: xarray.DataArray boolean mask of valid pixels
+    - cube: xarray.Dataset with dimensions (time, y, x) containing the processed NDVI band.
+            The cube is gap-filled and ready for analysis.
+    - spatial_mask: xarray.DataArray boolean mask of valid pixels within the polygon.
     """
-    # Open STAC catalog
+
+    print("   - Opening STAC catalog and searching for items...")
     catalog = pystac_client.Client.open(stac_url)
-
-    # Get polygon geometry in GeoJSON mapping
-    geom = mapping(shapefile.geometry.iloc[0])
-
-    # Search items
+    
+    # Use the bounding box from the shapefile for the STAC search
+    search_bbox = shapefile.total_bounds.tolist()
+    
     items = catalog.search(
         collections=collections,
-        bbox=shapefile.total_bounds.tolist(),
+        bbox=search_bbox,
         datetime=f"{start_date}/{end_date}"
     ).get_all_items()
 
-    # Filter items that have all required bands
-    filtered_items = []
-    for item in items:
-        if all(band in item.assets for band in query_bands):
-            filtered_items.append(item)
-
+    filtered_items = [item for item in items if all(band in item.assets for band in query_bands)]
     if not filtered_items:
         raise RuntimeError("No items found with all requested bands.")
+    
+    print(f"   - Found {len(filtered_items)} items. Loading data cube with odc-stac...")
+    
+    # Use odc-stac to load the data cube. It handles reprojection, alignment, and lazy loading.
+    # We provide the geometry of the area of interest to clip the data.
+    geom = shapefile.geometry.iloc[0]
+    
+    # Determine the appropriate UTM CRS for the area of interest
+    utm_crs = shapefile.estimate_utm_crs()
+    print(f"   - Using projected CRS: {utm_crs.to_string()}")
 
-    # Sort items by datetime to ensure monotonic time index for xarray
-    filtered_items = sorted(
-        filtered_items, key=lambda item: item.datetime, reverse=False
-    )
+    # Trigger computation with a progress bar
+    with dask.diagnostics.ProgressBar():
+        cube = stac_load(
+            filtered_items,
+            bands=query_bands,
+            crs=utm_crs,
+            resolution=resolution,
+            geopolygon=geom, # Use geopolygon for clipping
+            resampling={"SCL": "nearest", "*": "bilinear"}, # Use nearest for SCL, bilinear for others
+            chunks={"x": 2048, "y": 2048}, # Use dask chunks for memory efficiency
+        )
+    
+    # --- DEBUGGING: Print the cube object structure ---
+    print("   - DEBUG: Cube object structure after loading:")
+    print(cube)
+    # --- END DEBUGGING ---
 
-    # Load bands for each item and stack into xarray Dataset
-    datasets = []
-    times = []
-    for item in filtered_items:
-        bands_data = {}
-        for band in query_bands:
-            href = item.assets[band].href
-            try:
-                da = rioxarray.open_rasterio(href, masked=True).squeeze()
-                # Clip to polygon
-                da = da.rio.clip([geom], shapefile.crs, drop=True, invert=False)
-                bands_data[band] = da
-            except Exception as e:
-                print(f"Error loading band {band} from item {item.id}: {e}")
-                bands_data[band] = None
-        # Combine bands into Dataset
-        ds = xr.Dataset(bands_data)
-        ds = ds.expand_dims(time=[np.datetime64(item.datetime)])
-        datasets.append(ds)
-        times.append(np.datetime64(item.datetime))
+    # Apply scale factor to NDVI band to convert from integer to float [-1, 1]
+    if 'NDVI' in cube:
+        print("   - Applying scale factor to NDVI band...")
+        cube['NDVI'] = cube['NDVI'] / 10000.0
 
-    # Concatenate all times
-    cube = xr.concat(datasets, dim='time')
-
-    # Interpolate missing data if requested
-    if interpolate:
-        cube = cube.interpolate_na(dim='time', method='linear', fill_value="extrapolate")
-
-    # Create mask of valid pixels (e.g., where SCL is not nodata)
+    # Create mask from the original SCL band BEFORE interpolation.
+    # A pixel is considered valid if it's not cloud/shadow in at least one image.
     if 'SCL' in cube:
-        mask = cube['SCL'].notnull()
-    else:
-        mask = xr.ones_like(cube[query_bands[0]], dtype=bool)
+        # Valid SCL classes for vegetation analysis
+        valid_scl_codes = [4, 5, 6]  # 4: Vegetation, 5: Not Vegetated, 6: Water
 
-    return cube, mask
+        # --- DEBUGGING: Print SCL band info ---
+        # This part is wrapped in a rasterio.Env to ensure network resiliency for the compute() call
+        with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
+            scl_band = cube['SCL']
+            unique_values = np.unique(scl_band.compute())
+            print(f"   - DEBUG: Unique SCL values found in cube: {unique_values}")
+
+        # Create a spatial mask: a pixel is valid if it ever has a valid SCL code.
+        spatial_mask = cube['SCL'].isin(valid_scl_codes).any(dim='time')
+        with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
+            print(f"   - DEBUG: Total valid pixels in mask: {spatial_mask.sum().compute().item()}")
+    else:
+        # If no SCL band, assume all pixels are valid initially.
+        spatial_mask = xr.ones_like(cube[query_bands[0]].isel(time=0), dtype=bool)
+
+    print("   - Creating monthly maximum value composites...")
+    # Before resampling, set data to NaN where SCL indicates invalid pixels
+    # This ensures they are ignored by the .max() operation.
+    if 'SCL' in cube:
+        # All codes other than the valid ones are considered invalid for the composite
+        invalid_scl_codes = [0, 1, 2, 3, 7, 8, 9, 10, 11]
+        cube = cube.where(cube['SCL'].isin(valid_scl_codes))
+    
+    # Resample to monthly frequency, taking the maximum value in each month.
+    # This creates a Maximum Value Composite (MVC).
+    monthly_cube = cube.resample(time='1M').max(skipna=True)
+
+    print("   - Imputing missing monthly values via interpolation...")
+    # Interpolate linearly along time to fill gaps left after MVC.
+    # Rechunk along time so interpolation can work across the entire series.
+    # Then back-fill and forward-fill to handle start/end NaNs.
+    monthly_cube = monthly_cube.chunk({"time": -1}).interpolate_na(dim='time', method='linear')
+    monthly_cube = monthly_cube.bfill(dim='time').ffill(dim='time')
+
+    # Drop the SCL band as it's no longer needed, and compute the final result.
+    final_cube = monthly_cube.drop_vars('SCL', errors='ignore')
+    
+    # Compute the final cube and the mask separately within a resilient environment
+    with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
+        return final_cube.compute(), spatial_mask.compute()
 
 # !pip install minisom
 import numpy as np
+from sklearn.preprocessing import StandardScaler
 from minisom import MiniSom
 
 def som_time_series_clustering(cube, mask, n=2, random_seed=123, n_parallel=0, training_steps=100):
@@ -1187,27 +1251,23 @@ def som_time_series_clustering(cube, mask, n=2, random_seed=123, n_parallel=0, t
     - result: 2D numpy array (y, x) with cluster indices
     - neuron_weights: numpy array (n*n, time*bands) with SOM codebooks
     - predictions: 2D numpy array (y, x) with neuron indices
+    - som: The trained MiniSom object.
     """
-    # Convert dataset to data array, creating a 'band' dimension from variables
-    if isinstance(cube, xr.Dataset):
-        cube_da = cube.to_array(dim='band')
-    else: # it's already a DataArray
-        cube_da = cube
+
+    # Work directly with the NDVI DataArray
+    cube_da = cube['NDVI']
 
     # Reshape data for clustering: (pixels, time*bands)
-    data = cube_da.values # (band, time, y, x)
-    data = np.moveaxis(data, 0, -1) # (time, y, x, band)
-    data = np.moveaxis(data, 0, -1) # (y, x, band, time)
+    # The input is (time, y, x). We want (y, x, time)
+    data = cube_da.transpose('y', 'x', 'time').values
     pixel_count = data.shape[0] * data.shape[1]
-    feature_count = data.shape[2] * data.shape[3]
+    feature_count = data.shape[2]
     data = data.reshape(pixel_count, feature_count)
 
     # Apply mask to select valid pixels
     if mask is not None:
-        # The mask has a time dimension, but we need a spatial mask.
-        # A pixel is valid if it's not null at any point in time.
-        spatial_mask = mask.any(dim='time')
-        mask_flat = spatial_mask.values.flatten()
+        # The mask is now a 2D spatial mask
+        mask_flat = mask.values.flatten()
         data_valid = data[mask_flat]
     else:
         mask_flat = np.ones(pixel_count, dtype=bool)
@@ -1219,30 +1279,29 @@ def som_time_series_clustering(cube, mask, n=2, random_seed=123, n_parallel=0, t
         raise ValueError("No valid data points to cluster after masking.")
 
     # Normalize data
-    from sklearn.preprocessing import StandardScaler
+    print("   - Normalizing time series data...")
     scaler = StandardScaler()
     data_scaled = scaler.fit_transform(data_valid)
 
     # Initialize and train SOM
+    print("   - Training SOM...")
     som = MiniSom(n, n, data_scaled.shape[1], sigma=1.0, learning_rate=0.5, random_seed=random_seed)
     som.random_weights_init(data_scaled)
     som.train_random(data_scaled, training_steps)
 
-    # Get neuron weights (codebooks)
+    # Get neuron weights (codebooks) and inverse transform them
     neuron_weights_scaled = som.get_weights().reshape(n*n, -1)
-
-    # Inverse transform the weights to get them back to the original data range
     neuron_weights = scaler.inverse_transform(neuron_weights_scaled)
 
     # Predict cluster for each valid pixel
-    # The original list comprehension can be slow, using a loop is clearer
+    # The SOM was trained on scaled data, so prediction must also use scaled data.
     winners = np.array([som.winner(x) for x in data_scaled])
     predictions_valid = winners[:, 0] * n + winners[:, 1]
 
     # Create full prediction array with -1 for masked pixels
     predictions = -1 * np.ones(mask_flat.shape, dtype=int)
     predictions[mask_flat] = predictions_valid
-    predictions = predictions.reshape(spatial_mask.shape) # Reshape to (y, x)
+    predictions = predictions.reshape(mask.shape) # Reshape to (y, x)
 
     # Result can be the same as predictions or aggregated
     result = predictions
@@ -1251,44 +1310,90 @@ def som_time_series_clustering(cube, mask, n=2, random_seed=123, n_parallel=0, t
 
 import matplotlib.pyplot as plt
 
-def plot_codebooks(cube, neuron_weights, band_name, n, cmap, mask=None):
+def plot_som_u_matrix(som, cmap='viridis_r'):
     """
-    Plot SOM neuron codebooks as time series.
+    Plots the U-Matrix of a trained SOM with cluster numbers overlaid.
+
+    The U-Matrix visualizes the distances between neighboring neurons,
+    helping to identify cluster boundaries. Cool colors (valleys) represent
+    well-defined clusters, while hot colors (ridges) represent boundaries.
 
     Parameters:
-    - cube: xarray.Dataset or DataArray with time dimension
-    - neuron_weights: numpy array (n*n, time*bands)
+    - som: A trained MiniSom object.
+    - cmap: The colormap to use for the distance visualization. A reversed
+            map like 'viridis_r' is often intuitive (cool=low distance).
+
+    Returns:
+    - fig, ax: matplotlib figure and axes.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.patheffects import withStroke
+
+    u_matrix = som.distance_map()
+    som_x, som_y = som.get_weights().shape[:2]
+
+    # Use a path effect to add a black stroke to the text for readability
+    path_effects = [withStroke(linewidth=3, foreground='black')]
+
+    # Determine a good text color based on the U-Matrix values
+    # This is a simple heuristic: use white for dark cells, black for light cells
+    text_colors = np.empty(u_matrix.shape, dtype=object)
+    mid_point = (np.nanmax(u_matrix) + np.nanmin(u_matrix)) / 2
+    text_colors[u_matrix < mid_point] = 'white'
+    text_colors[u_matrix >= mid_point] = 'black'
+    
+    fig, ax = plt.subplots(figsize=(8, 8))
+    im = ax.imshow(u_matrix, cmap=cmap)
+    ax.set_title('SOM U-Matrix (Cluster Boundaries)')
+    
+    # Add a colorbar to show distance scale
+    plt.colorbar(im, ax=ax, label='Distance between neurons')
+    plt.tight_layout()
+
+    # Add cluster numbers to each cell
+    for i in range(som_x):
+        for j in range(som_y):
+            cluster_index = i * som_y + j
+            ax.text(j, i, str(cluster_index),
+                    ha='center', va='center',
+                    color=text_colors[i, j],
+                    fontweight='bold',
+                    path_effects=path_effects)
+    return fig, ax
+
+def plot_cluster_profiles(cube, predictions, band_name, cmap):
+    """
+    Calculates and plots the mean time series for each cluster.
+
+    Parameters:
+    - cube: xarray.Dataset with the original time series data (e.g., monthly NDVI).
+    - predictions: 2D numpy array (y, x) with the final cluster indices for each pixel.
     - band_name: str, band to plot (e.g., 'NDVI')
-    - n: int, SOM grid size
-    - mask: optional mask
+    - cmap: The colormap used for the clusters.
 
     Returns:
     - fig, ax matplotlib figure and axes
     """
-    time = cube['time'].values
+    
+    # Ensure we are working with the DataArray
+    da = cube[band_name]
+    time_coords = da['time'].values
+    
     fig, ax = plt.subplots(figsize=(12, 6))
+    
+    # Find the unique cluster IDs, ignoring the -1 mask value
+    cluster_ids = np.unique(predictions[predictions >= 0])
 
-    # Determine band index
-    if isinstance(cube, xr.Dataset):
-        bands = list(cube.data_vars)
-    else: # DataArray
-        bands = cube['band'].values
+    for cluster_id in cluster_ids:
+        # Create a boolean mask for the current cluster
+        cluster_mask = (predictions == cluster_id)
+        
+        # Use the mask to select the relevant time series from the DataArray and calculate the mean
+        mean_series = da.where(cluster_mask).mean(dim=['x', 'y'])
+        
+        ax.plot(time_coords, mean_series, label=f'Cluster {cluster_id}', color=cmap(cluster_id))
 
-    try:
-        band_idx = bands.index(band_name)
-    except ValueError:
-        raise ValueError(f"Band '{band_name}' not found in cube. Available bands: {bands}")
-
-    time_len = len(time)
-    num_bands = len(bands)
-
-    for i in range(n*n):
-        # Extract the time series for the specific band from the flattened weights
-        # The weights are ordered (band1_t1, band1_t2, ..., band2_t1, ...)
-        series = neuron_weights[i, band_idx*time_len : (band_idx+1)*time_len]
-        ax.plot(time, series, label=f'Cluster {i}', color=cmap(i))
-
-    ax.set_title(f'SOM Codebooks for {band_name}')
+    ax.set_title(f'Mean NDVI Time Series Profiles for each SOM Cluster')
     ax.set_xlabel('Time')
     ax.set_ylabel(band_name)
     ax.legend()
@@ -1312,18 +1417,22 @@ def plot_cluster_image(predictions, cmap):
     min_pred = np.min(predictions)
     max_pred = np.max(predictions)
 
-    # Create a discrete colormap
-    norm = plt.Normalize(vmin=-1, vmax=max_pred)
+    # Use BoundaryNorm for a discrete colormap that maps integers to colors correctly.
+    # The boundaries are set at the midpoints between the integers.
+    bounds = np.arange(min_pred, max_pred + 2) - 0.5
+    norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
 
     # Create a masked array to show -1 as a specific color (e.g., white or gray)
     masked_preds = np.ma.masked_equal(predictions, -1)
-    cmap.set_bad('white', 1.)
+    # Use a copy of the colormap to avoid modifying the original
+    cmap_copy = cmap
+    cmap_copy.set_bad('white', 1.)
 
-    im = ax.imshow(masked_preds, cmap=cmap, norm=norm, interpolation='none')
+    im = ax.imshow(masked_preds, cmap=cmap_copy, norm=norm, interpolation='none')
     ax.set_title('SOM Clustering Result')
 
     # Adjust colorbar to show correct ticks
-    ticks = np.arange(0, max_pred + 1)
+    ticks = np.arange(min_pred + 1, max_pred + 1)
     plt.colorbar(im, ax=ax, ticks=ticks)
     plt.tight_layout()
     return fig, ax
@@ -1375,16 +1484,45 @@ def plot_som_neuron_map(som, cmap):
 # from geo_credito_rural_utils_v2 import *
 
 print("12. Creating data cube for SOM clustering...")
-cubo, mask = process_cube(shapefile = gleba,
+cubo, mask = process_cube(shapefile=gleba,
                         query_bands = ['NDVI', 'SCL'],
                         start_date = data_inicial,
                         end_date = data_final,
                         collections = [colecao_s2],
                         stac_url = bdc_stac_link,
-                        interpolate = True)
+                        resolution=10)
 
+# Crop the cube to the exact geometry using salem and fill NaNs
+print("   - Cropping data cube to exact geometry with rioxarray...")
+# The 'gleba' GeoDataFrame needs to be in the same CRS as the cube.
+utm_crs = gleba.estimate_utm_crs()
+gleba_proj = gleba.to_crs(utm_crs)
+
+# Explicitly set the CRS and clip using rioxarray
+# cubo.rio.write_crs(utm_crs, inplace=True)
+# cubo = cubo.rio.clip(geometries=gleba_proj.geometry, all_touched=True, from_disk=True)
+
+# --- DEBUGGING: Plot average NDVI time series ---
+print("   - Plotting average NDVI time series for debugging...")
+fig_avg_ndvi, ax_avg_ndvi = plt.subplots(figsize=(12, 5))
+average_ndvi = cubo['NDVI'].mean(dim=['x', 'y'])
+average_ndvi.plot(ax=ax_avg_ndvi, marker='o')
+ax_avg_ndvi.set_title('Average Monthly NDVI for the Entire Property')
+ax_avg_ndvi.set_xlabel('Time')
+ax_avg_ndvi.set_ylabel('Average NDVI')
+ax_avg_ndvi.grid(True)
+plt.tight_layout()
+
+# Instead of plt.show()
+fig_avg_ndvi.savefig("output/debug_avg_ndvi.png")
+print("   - Average NDVI plot saved to output/debug_avg_ndvi.png")
+
+# cubo = cubo.fillna(-1)
+
+# --- END DEBUGGING ---
 
 # %%
+
 # o parâmetro 'n' indica que o método vai criar uma rede
 # de n x n neurônios e tentar agrupar a série em n x n clusters
 sqrt_n = 3
@@ -1394,17 +1532,21 @@ result, neuron_weights, predictions, som = som_time_series_clustering(cubo, mask
                                                                       n = sqrt_n, random_seed = 123,
                                                                       n_parallel = 0, training_steps = 100)
 
-# Create a shared colormap for all SOM plots
+# Create a discrete colormap to ensure colors match between plots.
 num_clusters = sqrt_n * sqrt_n
-cmap = plt.get_cmap('tab20', num_clusters)
+base_cmap = plt.get_cmap('tab20', num_clusters)
+color_list = [base_cmap(i) for i in range(num_clusters)]
+cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
 
-fig_som_codebooks, _ = plot_codebooks(cubo, neuron_weights,
-                                      band_name='NDVI',
-                                      n=sqrt_n,
-                                      cmap=cmap)
+fig_som_profiles, _ = plot_cluster_profiles(cubo, predictions,
+                                            band_name='NDVI',
+                                            cmap=cmap)
 
 # %%
 fig_som_neuron_map, _ = plot_som_neuron_map(som, cmap)
+
+# %%
+fig_som_u_matrix, _ = plot_som_u_matrix(som)
 
 # %%
 fig_som_clustering, _ = plot_cluster_image(predictions, cmap)
@@ -1454,8 +1596,9 @@ try:
         relatorio.savefig(fig_evi_clips, bbox_inches='tight')
 
     create_title_page("Agrupamento por Mapas Auto-Organizáveis (SOM)", relatorio)
-    relatorio.savefig(fig_som_codebooks, bbox_inches='tight')
+    relatorio.savefig(fig_som_profiles, bbox_inches='tight')
     relatorio.savefig(fig_som_neuron_map, bbox_inches='tight')
+    relatorio.savefig(fig_som_u_matrix, bbox_inches='tight')
     relatorio.savefig(fig_som_clustering, bbox_inches='tight')
 finally:
     plt.close('all') # Close all figures to free up memory

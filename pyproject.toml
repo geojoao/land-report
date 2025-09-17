@@ -22,5 +22,9 @@ dependencies = [
     "pyproj",
     "minisom",
     "rasterio",
-    "scikit-learn"
+    "scikit-learn",
+    "dask",
+    "odc-stac",
+    "bottleneck",
+    "salem"
 ]
