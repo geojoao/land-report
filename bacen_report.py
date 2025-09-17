@@ -1608,7 +1608,7 @@ metadados['Title'] = f'Relatório sobre gleba {ref_bacen}, entre {data_inicial} 
 metadados['Author'] = 'Geo Crédito Rural'
 metadados['Subject'] = 'Cruzamento com séries temporais e estatísticas'
 metadados['Keywords'] = 'gleba, crédito rural, proagro, sicor, sentinel, cbers'
-metadados['CreationDate'] = datetime.today()
+metadados['CreationDate'] = datetime.datetime.today()
 
 relatorio.close()
 
