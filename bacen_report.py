@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import matplotlib
 # Use a non-interactive backend to prevent plots from being displayed.
 matplotlib.use('Agg')
+#matplotlib.use('TkAgg')
 import contextily as ctx
 
 import matplotlib.patches as mpatches
@@ -156,6 +157,20 @@ def load_ibge_municipalities():
     gdf = gdf.to_crs("EPSG:4326")  # ensure WGS84
     return gdf
 
+# ---------------------------------------------------
+# Function to download and load IBGE states
+# ---------------------------------------------------
+def load_ibge_states():
+    url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip"
+    r = requests.get(url)
+    z = zipfile.ZipFile(io.BytesIO(r.content))
+    # Find the shapefile in the zip, it's usually named BR_UF_2024.shp
+    shp_path = [f for f in z.namelist() if f.endswith(".shp") and 'UF' in f][0]
+    z.extractall("ibge_states")  # Extract locally
+    gdf = gpd.read_file(f"ibge_states/{shp_path}")
+    gdf = gdf.to_crs("EPSG:4326")  # ensure WGS84
+    return gdf
+
 
 # ---------------------------------------------------
 # Function to plot rural property with minimap + info
@@ -163,7 +178,7 @@ def load_ibge_municipalities():
 def plot_rural_property(property_gdf, municipalities_gdf=None):
     """
     Generate a rural property geographical location map.
-    
+
     Parameters
     ----------
     property_gdf : GeoDataFrame
@@ -171,7 +186,7 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         Columns 'name', 'city', 'state' are expected.
     municipalities_gdf : GeoDataFrame, optional
         GeoDataFrame of municipalities for minimap.
-    
+
     Returns
     -------
     fig : matplotlib.figure.Figure
@@ -187,40 +202,91 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
 
     # Main map
     ax_main = fig.add_axes([0.05, 0.05, 0.65, 0.9])
-    property_gdf.to_crs(epsg=3857).plot(ax=ax_main, facecolor="none", edgecolor="red", linewidth=2)
-    ctx.add_basemap(ax_main, source=ctx.providers.Esri.WorldImagery)
+
+    # --- Create a square map extent ---
+    # Project to Web Mercator (EPSG:3857) for calculations
+    property_proj = property_gdf.to_crs(epsg=3857)
+    minx, miny, maxx, maxy = property_proj.total_bounds
+
+    # Find the center and the largest dimension of the property's bounding box
+    center_x = (minx + maxx) / 2
+    center_y = (miny + maxy) / 2
+    max_dim = max(maxx - minx, maxy - miny)
+
+    # Define a new square extent, 20% larger than the property's max dimension
+    buffer = max_dim * 0.2
+    new_half_side = (max_dim / 2) + buffer
+    ax_main.set_xlim(center_x - new_half_side, center_x + new_half_side)
+    ax_main.set_ylim(center_y - new_half_side, center_y + new_half_side)
+
+    # Add basemap first to fill the square extent
+    ctx.add_basemap(ax_main, source=ctx.providers.Esri.WorldImagery, crs='epsg:3857', attribution="")
+    # Now plot the property on top of the basemap
+    property_proj.plot(ax=ax_main, facecolor="none", edgecolor="red", linewidth=2)
+
+    # Add frame to main map
+    ax_main.spines['top'].set_visible(True); ax_main.spines['right'].set_visible(True); ax_main.spines['bottom'].set_visible(True); ax_main.spines['left'].set_visible(True)
     ax_main.set_axis_off()
 
-    # Add scalebar
+    # Add scalebar with transparent background
     if ScaleBar is not None:
-        scalebar = ScaleBar(1, location='lower right')
+        scalebar = ScaleBar(1, location='lower right', box_alpha=0, border_pad=0.5)
         ax_main.add_artist(scalebar)
 
-    # North arrow
-    ax_main.annotate('N', xy=(0.95, 0.15), xytext=(0.95, 0.05),
-                     arrowprops=dict(facecolor='black', width=5, headwidth=15),
-                     ha='center', va='center', fontsize=12,
-                     xycoords=ax_main.transAxes)
+    # Calculate area and perimeter using an appropriate equal-area projection
+    # Using Brazil Albers Equal Area Conic projection (EPSG:102033) via its PROJ string
+    # to ensure compatibility across different PROJ library versions.
+    brazil_aea_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+    property_aea = property_gdf.to_crs(brazil_aea_proj)
 
-    # Minimap
-    if municipalities_gdf is not None:
-        ax_mini = fig.add_axes([0.72, 0.65, 0.25, 0.25])
-        municipalities_gdf.to_crs(epsg=3857).plot(ax=ax_mini, facecolor="none", edgecolor="black")
-        property_gdf.to_crs(epsg=3857).plot(ax=ax_mini, facecolor="red", alpha=0.5)
-        ax_mini.set_axis_off()
-        ax_mini.set_title("Municipality", fontsize=10)
+    area_ha = property_aea.geometry.area.iloc[0] / 10000  # Convert sq meters to hectares
+    perimeter_m = property_aea.geometry.length.iloc[0]
 
-    # Info panel
+    # --- Info Panel Table ---
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off")
-    info_text = f"""
-General information about the rural property
 
-City: {property_gdf['city'].iloc[0]}
-State: {property_gdf['state'].iloc[0]}
-Centroid: {lat:.4f}, {lon:.4f}
-"""
-    ax_info.text(0, 1, info_text, va="top", fontsize=10)
+    # Prepare data for the table
+    table_data = [
+        ["City", f"{property_gdf['city'].iloc[0]}"],
+        ["State", f"{property_gdf['state'].iloc[0]}"],
+        ["Centroid", f"{lat:.4f}, {lon:.4f}"],
+        ["Area", f"{area_ha:.2f} ha"],
+        ["Perimeter", f"{perimeter_m:.2f} m"]
+    ]
+    
+    # Create the table
+    table = ax_info.table(cellText=table_data,
+                          colLabels=["Attribute", "Value"],
+                          loc='center',
+                          cellLoc='left',
+                          colWidths=[0.3, 0.7])
+
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5) # Adjust cell height
+    #ax_info.set_title("Rural Property Info", fontsize=12, pad=20)
+
+    # Minimap
+    if municipalities_gdf is not None and not municipalities_gdf.empty:
+        states_gdf = load_ibge_states()
+        state_name = property_gdf['state'].iloc[0]
+        state_geom = states_gdf[states_gdf['NM_UF'] == state_name]
+
+        ax_mini = fig.add_axes([0.72, 0.65, 0.25, 0.25])
+
+        # Plot state
+        state_geom.plot(ax=ax_mini, facecolor="#d3d3d3", edgecolor="black") # light grey
+        # Plot city
+        municipalities_gdf.plot(ax=ax_mini, facecolor="#808080", edgecolor="black") # grey
+        # Plot property centroid
+        property_gdf.centroid.plot(ax=ax_mini, color='red', markersize=50)
+
+        # Add frame and title
+        ax_mini.spines['top'].set_visible(True); ax_mini.spines['right'].set_visible(True); ax_mini.spines['bottom'].set_visible(True); ax_mini.spines['left'].set_visible(True)
+        ax_mini.set_axis_off()
+        # ax_mini.set_title("Location", fontsize=10) # Title removed as requested
 
     return fig
 
@@ -248,8 +314,8 @@ joined["city"] = joined["NM_MUN"]
 joined["state"] = joined["NM_UF"]
 
 # Plot
-fig_localization = plot_rural_property(joined, municipalities_gdf=municipios[municipios["NM_MUN"] == joined["city"].iloc[0]])
-
+fig_localization = plot_rural_property(joined, municipalities_gdf=municipios[municipios["NM_MUN"] == joined["city"].iloc[0]].to_crs('epsg:4326'))
+fig_localization.savefig("output/fig_localization.png")
 
 # %%
 # indicar um valor específico de REF_BACEN
@@ -267,6 +333,7 @@ data_final = '2022-12-31'
 # definir o total de pontos aleatórios por gleba para 
 # visualização das séries temporais
 total_pontos = 15
+grid_spacing_meters = 1000 # Distance in meters for grid points
 largura_figuras = 18
 
 bdc_stac_link = 'https://data.inpe.br/bdc/stac/v1'
@@ -535,41 +602,51 @@ fig_mapbiomas.set_size_inches(largura_figuras, 8)
 import random
 from shapely.geometry import Point, Polygon, MultiPolygon
 
-def generate_grid_points(geometry, approx_num_points):
+def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     """
-    Generate a grid of points inside a polygon or multipolygon geometry.
+    Generate a grid of points inside a polygon with a specified distance in meters.
 
     Parameters:
-    - geometry: shapely Polygon or MultiPolygon, or GeoSeries with one polygon
-    - approx_num_points: int, approximate number of points to generate
+    - geometry_4326: shapely Polygon or MultiPolygon in EPSG:4326.
+    - spacing_meters: int, the distance between grid points in meters.
 
     Returns:
-    - points: list of shapely.geometry.Point objects inside the geometry
+    - points: list of shapely.geometry.Point objects in EPSG:4326 inside the geometry.
     """
-    minx, miny, maxx, maxy = geometry.bounds
-    
-    # Estimate grid spacing to get approximately the desired number of points
-    # This is a rough estimation based on the bounding box area
-    bbox_area = (maxx - minx) * (maxy - miny)
-    if bbox_area == 0: return []
-    
-    spacing = np.sqrt(bbox_area / approx_num_points)
-    
-    # Create grid coordinates
-    x_coords = np.arange(minx + spacing/2, maxx, spacing)
-    y_coords = np.arange(miny + spacing/2, maxy, spacing)
+    # Create a GeoSeries to easily handle CRS
+    gs = gpd.GeoSeries([geometry_4326], crs="EPSG:4326")
 
-    points = []
+    # Estimate a suitable UTM CRS for the geometry
+    utm_crs = gs.estimate_utm_crs()
+
+    # Reproject the geometry to the estimated UTM CRS
+    geometry_proj = gs.to_crs(utm_crs).iloc[0]
+
+    # Get the bounding box in the projected CRS
+    minx, miny, maxx, maxy = geometry_proj.bounds
+    
+    # Create grid coordinates in the projected CRS
+    x_coords = np.arange(minx + spacing_meters/2, maxx, spacing_meters)
+    y_coords = np.arange(miny + spacing_meters/2, maxy, spacing_meters)
+
+    points_proj = []
     for x in x_coords:
         for y in y_coords:
             point = Point(x, y)
-            if geometry.contains(point):
-                points.append(point)
+            if geometry_proj.contains(point):
+                points_proj.append(point)
 
-    return points
+    if not points_proj:
+        return []
 
-print(f"6. Generating a grid of approximately {total_pontos} points within the property...")
-pontos_aleatorios = generate_grid_points(gleba_4326, total_pontos)
+    # Create a GeoDataFrame from the projected points and reproject back to EPSG:4326
+    points_gdf_proj = gpd.GeoDataFrame(geometry=points_proj, crs=utm_crs)
+    points_gdf_4326 = points_gdf_proj.to_crs("EPSG:4326")
+
+    return list(points_gdf_4326.geometry)
+
+print(f"6. Generating a grid with {grid_spacing_meters}m spacing within the property...")
+pontos_aleatorios = generate_grid_points_by_distance(gleba_4326, grid_spacing_meters)
 print(f"   - Generated {len(pontos_aleatorios)} points.")
 
 # Update total_pontos to the actual number of generated points
@@ -623,16 +700,50 @@ for ponto in pontos_aleatorios:
     vetor_ts_wfi.append(ts_wfi)
 
 # %%
-fig_time_series = plt.figure(figsize=(largura_figuras, 4))
-for i, (s2, wfi) in enumerate(zip(vetor_ts_s2, vetor_ts_wfi)):
-    plt.plot(s2.timeline, np.array(s2.NDVI)/10000, color='tab:green', alpha=0.7, linewidth=1, label=f'Point {i+1} (Sentinel)' if i == 0 else "")
-    plt.plot(wfi.timeline,np.array(wfi.NDVI)/10000, color='tab:red', alpha=0.7, linewidth=1, label=f'Point {i+1} (CBERS)' if i == 0 else "")
-plt.grid()
-plt.xticks(rotation=45, fontsize=10)
-plt.yticks(rotation=45, fontsize=10)
-plt.ylim([0.01, 1])
-plt.title(f'{total_pontos} séries temporais NDVI para gleba REF_BACEN {ref_bacen}, entre {data_inicial} e {data_final}')
-plt.legend();
+import matplotlib.gridspec as gridspec
+
+vetor_figs_time_series = []
+
+for i, (s2, wfi, ponto_atual) in enumerate(zip(vetor_ts_s2, vetor_ts_wfi, pontos_aleatorios)):
+    # Create a new figure for each time series
+    fig = plt.figure(figsize=(largura_figuras, 6))
+    
+    # Create a 1x2 grid with a width ratio of 3:1 for the plots
+    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1])
+    
+    # Main plot for the time series
+    ax_main = plt.subplot(gs[0])
+
+    # Plot the time series data
+    ax_main.plot(s2.timeline, np.array(s2.NDVI)/10000, color='tab:green', alpha=0.9, linewidth=1.5, marker='o', markersize=4, label='Sentinel-2 NDVI')
+    ax_main.plot(wfi.timeline, np.array(wfi.NDVI)/10000, color='tab:red', alpha=0.9, linewidth=1.5, marker='x', markersize=4, label='CBERS-WFI NDVI')
+    
+    ax_main.grid(True, linestyle='--', alpha=0.6)
+    ax_main.tick_params(axis='x', labelrotation=45, labelsize=10)
+    ax_main.tick_params(axis='y', labelsize=10)
+    ax_main.set_ylim([0.0, 1.0])
+    ax_main.set_title(f'NDVI Time Series for Point {i+1} (REF_BACEN {ref_bacen})', fontsize=14)
+    ax_main.set_xlabel("Date")
+    ax_main.set_ylabel("NDVI")
+    ax_main.legend()
+
+    # --- Create Side Map ---
+    ax_map = plt.subplot(gs[1])
+    gpd.GeoSeries(gleba_4326).plot(ax=ax_map, color='lightgray', edgecolor='black')
+    
+    all_points_gdf = gpd.GeoDataFrame(geometry=pontos_aleatorios)
+    all_points_gdf.plot(ax=ax_map, marker='.', color='blue', markersize=30)
+    
+    current_point_gdf = gpd.GeoDataFrame(geometry=[ponto_atual])
+    current_point_gdf.plot(ax=ax_map, marker='*', color='red', markersize=150, edgecolor='white')
+    
+    ax_map.set_title(f'Point {i+1} Location')
+    ax_map.set_xticks([])
+    ax_map.set_yticks([])
+    
+    fig.tight_layout()
+    
+    vetor_figs_time_series.append(fig)
 
 # %% [markdown]
 # ## Visualização de todas as séries temporais pertencentes à gleba
@@ -1025,6 +1136,68 @@ for item in time_ordered_items: #.items():
 
 # %%
 #%%time
+# This cell creates and plots RGB composites without cloud masking for each available image.
+
+print("11. Processing images for RGB composites (no cloud mask)...")
+
+# Setup for plotting
+colunas_rgb = 4
+linhas_plot_rgb = math.ceil(total_rasters / colunas_rgb) if total_rasters > 0 else 1
+fig_rgb_clips = plt.figure(figsize=(largura_figuras, 3 * linhas_plot_rgb))
+plt.suptitle('RGB (B08, B11, B04) Composites without Cloud Mask', fontsize=16)
+
+t_rgb = 0
+set_of_items_rgb = set()
+
+for item in time_ordered_items:
+    if item.properties['datetime'] in set_of_items_rgb:
+        continue
+    set_of_items_rgb.add(item.properties['datetime'])
+    t_rgb += 1
+    title = item.properties['datetime'][:10]
+    print(f" - Processing RGB for image {t_rgb}/{total_rasters} from {title}...")
+
+    try:
+        # Load bands without cloud masking
+        banda_04 = carregar_banda_sentinel2_bdc(item, 'B04', gleba)
+        if banda_04.size == 0:
+            print(f"   - Skipping {item.id} due to empty B04 band.")
+            continue
+        
+        banda_08 = carregar_banda_sentinel2_bdc(item, 'B08', gleba)
+        banda_11 = carregar_banda_sentinel2_bdc(item, 'B11', gleba)
+
+        # Resize bands to match B04 resolution
+        banda_11_zoom = resize(banda_11, banda_04.shape, order=1, preserve_range=True, anti_aliasing=True)
+
+        # Create RGB matrix (B08, B11, B04)
+        L = 2**12 
+        N = 2
+        
+        matriz_rgb = np.zeros((banda_04.shape[0], banda_04.shape[1], 3), dtype=np.float32)
+        matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08, L), L, N) / L
+        matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
+        matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04, L), L, N) / L
+        
+        # Clip values to [0, 1] range for imshow
+        matriz_rgb = np.clip(matriz_rgb, 0, 1)
+
+        # Plotting
+        ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
+        ax.imshow(matriz_rgb)
+        ax.set_title(title)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    except Exception as e:
+        print(f"   - Could not process item {item.id}: {e}")
+        ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
+        ax.set_title(f"{title}\n(Error)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+# %%
+#%%time
 # This cell calculates and plots the Enhanced Vegetation Index (EVI) for each available image.
 
 print("11. Processing images for EVI calculation...")
@@ -1114,33 +1287,45 @@ import numpy as np
 from shapely.geometry import mapping
 import dask.diagnostics
 from odc.stac import stac_load
+import rasterio
+import dask
+
 
 def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, resolution=10):
     """
     Load and preprocess a data cube clipped to the shapefile polygon.
-    This version is optimized for memory usage using odc-stac.
-    It creates a gap-filled monthly maximum value composite.
+    Combines SCL-based masking with shapefile geometry using rioxarray.clip.
+    Areas outside the geometry or with unwanted values are set to -1.
 
-    Parameters:
-    - shapefile: GeoDataFrame or GeoSeries with polygon geometry (in EPSG:4326)
-    - query_bands: list of band names to load (e.g., ['NDVI', 'SCL'])
-    - start_date, end_date: strings 'YYYY-MM-DD'
-    - collections: list of STAC collection names
-    - stac_url: STAC API URL string
-    - resolution: int, the target resolution for the output cube.
+    Parameters
+    ----------
+    shapefile : GeoDataFrame
+        Polygon(s) defining the AOI, in EPSG:4326.
+    query_bands : list
+        List of band names to load (e.g., ['NDVI', 'SCL']).
+    start_date, end_date : str
+        Date range as 'YYYY-MM-DD'.
+    collections : list
+        List of STAC collection names.
+    stac_url : str
+        STAC API URL.
+    resolution : int, optional
+        Target resolution in meters.
 
-    Returns:
-    - cube: xarray.Dataset with dimensions (time, y, x) containing the processed NDVI band.
-            The cube is gap-filled and ready for analysis.
-    - spatial_mask: xarray.DataArray boolean mask of valid pixels within the polygon.
+    Returns
+    -------
+    final_cube : xarray.Dataset
+        Data cube with invalid/outside pixels replaced by -1.
+    spatial_mask : xarray.DataArray
+        Boolean mask of valid pixels inside AOI and with valid SCL.
     """
 
     print("   - Opening STAC catalog and searching for items...")
     catalog = pystac_client.Client.open(stac_url)
-    
-    # Use the bounding box from the shapefile for the STAC search
+
+    # Search extent: bounding box from shapefile
     search_bbox = shapefile.total_bounds.tolist()
-    
+
     items = catalog.search(
         collections=collections,
         bbox=search_bbox,
@@ -1150,85 +1335,70 @@ def process_cube(shapefile, query_bands, start_date, end_date, collections, stac
     filtered_items = [item for item in items if all(band in item.assets for band in query_bands)]
     if not filtered_items:
         raise RuntimeError("No items found with all requested bands.")
-    
+
     print(f"   - Found {len(filtered_items)} items. Loading data cube with odc-stac...")
-    
-    # Use odc-stac to load the data cube. It handles reprojection, alignment, and lazy loading.
-    # We provide the geometry of the area of interest to clip the data.
+
     geom = shapefile.geometry.iloc[0]
-    
-    # Determine the appropriate UTM CRS for the area of interest
     utm_crs = shapefile.estimate_utm_crs()
     print(f"   - Using projected CRS: {utm_crs.to_string()}")
 
-    # Trigger computation with a progress bar
     with dask.diagnostics.ProgressBar():
         cube = stac_load(
             filtered_items,
             bands=query_bands,
             crs=utm_crs,
             resolution=resolution,
-            geopolygon=geom, # Use geopolygon for clipping
-            resampling={"SCL": "nearest", "*": "bilinear"}, # Use nearest for SCL, bilinear for others
-            chunks={"x": 2048, "y": 2048}, # Use dask chunks for memory efficiency
+            geopolygon=geom,
+            resampling={"SCL": "nearest", "*": "bilinear"},
+            chunks={"x": 2048, "y": 2048},
         )
-    
-    # --- DEBUGGING: Print the cube object structure ---
-    print("   - DEBUG: Cube object structure after loading:")
-    print(cube)
-    # --- END DEBUGGING ---
 
-    # Apply scale factor to NDVI band to convert from integer to float [-1, 1]
-    if 'NDVI' in cube:
+    # Scale NDVI if present
+    if "NDVI" in cube:
         print("   - Applying scale factor to NDVI band...")
-        cube['NDVI'] = cube['NDVI'] / 10000.0
+        cube["NDVI"] = cube["NDVI"] / 10000.0
 
-    # Create mask from the original SCL band BEFORE interpolation.
-    # A pixel is considered valid if it's not cloud/shadow in at least one image.
-    if 'SCL' in cube:
-        # Valid SCL classes for vegetation analysis
-        valid_scl_codes = [4, 5, 6]  # 4: Vegetation, 5: Not Vegetated, 6: Water
-
-        # --- DEBUGGING: Print SCL band info ---
-        # This part is wrapped in a rasterio.Env to ensure network resiliency for the compute() call
+    # --- Create SCL-based mask ---
+    if "SCL" in cube:
+        valid_scl_codes = [4, 5, 6]  # vegetation, not vegetated, water
         with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
-            scl_band = cube['SCL']
-            unique_values = np.unique(scl_band.compute())
+            unique_values = np.unique(cube["SCL"].compute())
             print(f"   - DEBUG: Unique SCL values found in cube: {unique_values}")
-
-        # Create a spatial mask: a pixel is valid if it ever has a valid SCL code.
-        spatial_mask = cube['SCL'].isin(valid_scl_codes).any(dim='time')
-        with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
-            print(f"   - DEBUG: Total valid pixels in mask: {spatial_mask.sum().compute().item()}")
+        scl_mask = cube["SCL"].isin(valid_scl_codes).any(dim="time")
     else:
-        # If no SCL band, assume all pixels are valid initially.
-        spatial_mask = xr.ones_like(cube[query_bands[0]].isel(time=0), dtype=bool)
+        scl_mask = xr.ones_like(cube[query_bands[0]].isel(time=0), dtype=bool)
 
+    # --- Clip cube to shapefile geometry using rioxarray ---
+    cube = cube.rio.write_crs(utm_crs, inplace=False)
+    cube = cube.rio.clip(shapefile.geometry.values, shapefile.crs, drop=False, invert=False)
+
+    # Geometry mask: True inside polygon, False outside
+    geom_mask = ~cube.isnull().to_array().all("variable").any("time")
+
+    # Combine SCL and geometry masks
+    spatial_mask = scl_mask & geom_mask
+
+    # --- Build monthly maximum composites ---
     print("   - Creating monthly maximum value composites...")
-    # Before resampling, set data to NaN where SCL indicates invalid pixels
-    # This ensures they are ignored by the .max() operation.
-    if 'SCL' in cube:
-        # All codes other than the valid ones are considered invalid for the composite
-        invalid_scl_codes = [0, 1, 2, 3, 7, 8, 9, 10, 11]
-        cube = cube.where(cube['SCL'].isin(valid_scl_codes))
-    
-    # Resample to monthly frequency, taking the maximum value in each month.
-    # This creates a Maximum Value Composite (MVC).
-    monthly_cube = cube.resample(time='1M').max(skipna=True)
+    if "SCL" in cube:
+        cube = cube.where(cube["SCL"].isin(valid_scl_codes))
 
-    print("   - Imputing missing monthly values via interpolation...")
-    # Interpolate linearly along time to fill gaps left after MVC.
-    # Rechunk along time so interpolation can work across the entire series.
-    # Then back-fill and forward-fill to handle start/end NaNs.
-    monthly_cube = monthly_cube.chunk({"time": -1}).interpolate_na(dim='time', method='linear')
-    monthly_cube = monthly_cube.bfill(dim='time').ffill(dim='time')
+    monthly_cube = cube.resample(time="1M").max(skipna=True)
+    monthly_cube = monthly_cube.chunk({"time": -1}).interpolate_na(dim="time", method="linear")
+    monthly_cube = monthly_cube.bfill(dim="time").ffill(dim="time")
 
-    # Drop the SCL band as it's no longer needed, and compute the final result.
-    final_cube = monthly_cube.drop_vars('SCL', errors='ignore')
-    
-    # Compute the final cube and the mask separately within a resilient environment
+    final_cube = monthly_cube.drop_vars("SCL", errors="ignore")
+
+    # --- Replace outside/invalid pixels with -1 ---
+    masked_bands = {}
+    for band, da in final_cube.data_vars.items():
+        masked_bands[band] = da.where(spatial_mask, -1)
+
+    final_cube = xr.Dataset(masked_bands, coords=final_cube.coords)
+
     with rasterio.Env(GDAL_HTTP_RETRY=5, GDAL_HTTP_RETRY_DELAY=10, GDAL_HTTP_TIMEOUT=120):
         return final_cube.compute(), spatial_mask.compute()
+
 
 # !pip install minisom
 import numpy as np
@@ -1405,35 +1575,47 @@ def plot_cluster_image(predictions, cmap):
     Plot spatial cluster assignments.
 
     Parameters:
-    - predictions: 2D array with cluster indices
-    - cmap: The colormap to use for clusters.
+    - predictions: 2D array with cluster indices (with -1 for masked pixels)
+    - cmap: matplotlib colormap for valid clusters
 
     Returns:
     - fig, ax matplotlib figure and axes
     """
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(largura_figuras, largura_figuras * 0.8))
-    # Handle case where no clusters were assigned (-1)
-    min_pred = np.min(predictions)
-    max_pred = np.max(predictions)
+    fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Use BoundaryNorm for a discrete colormap that maps integers to colors correctly.
-    # The boundaries are set at the midpoints between the integers.
+    # Mask invalid pixels (-1)
+    masked_preds = np.ma.masked_equal(predictions, -1)
+
+    # Get only the real cluster IDs
+    valid_clusters = np.unique(masked_preds.compressed())
+    min_pred = valid_clusters.min()
+    max_pred = valid_clusters.max()
+
+    # Ensure colormap has enough colors
+    n_clusters = max_pred - min_pred + 1
+    if isinstance(cmap, matplotlib.colors.ListedColormap):
+        if cmap.N < n_clusters:
+            base = plt.get_cmap('tab20', n_clusters)
+            color_list = [base(i) for i in range(n_clusters)]
+            cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
+    else:
+        cmap = plt.get_cmap(cmap, n_clusters)
+
+    # Create discrete boundaries for clusters (excluding -1)
     bounds = np.arange(min_pred, max_pred + 2) - 0.5
     norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
 
-    # Create a masked array to show -1 as a specific color (e.g., white or gray)
-    masked_preds = np.ma.masked_equal(predictions, -1)
-    # Use a copy of the colormap to avoid modifying the original
-    cmap_copy = cmap
-    cmap_copy.set_bad('white', 1.)
+    # Use white for the masked (-1) areas
+    cmap = cmap.copy()
+    cmap.set_bad("white")
 
-    im = ax.imshow(masked_preds, cmap=cmap_copy, norm=norm, interpolation='none')
-    ax.set_title('SOM Clustering Result')
+    im = ax.imshow(masked_preds, cmap=cmap, norm=norm, interpolation="none")
+    ax.set_title("SOM Clustering Result")
 
-    # Adjust colorbar to show correct ticks
-    ticks = np.arange(min_pred + 1, max_pred + 1)
+    # Colorbar only for valid clusters
+    ticks = np.arange(min_pred, max_pred + 1)
     plt.colorbar(im, ax=ax, ticks=ticks)
+
     plt.tight_layout()
     return fig, ax
 
@@ -1542,6 +1724,8 @@ fig_som_profiles, _ = plot_cluster_profiles(cubo, predictions,
                                             band_name='NDVI',
                                             cmap=cmap)
 
+fig_som_profiles.savefig("output/fig_som_profiles.png")
+
 # %%
 fig_som_neuron_map, _ = plot_som_neuron_map(som, cmap)
 
@@ -1550,6 +1734,8 @@ fig_som_u_matrix, _ = plot_som_u_matrix(som)
 
 # %%
 fig_som_clustering, _ = plot_cluster_image(predictions, cmap)
+
+fig_som_clustering.savefig("output/fig_som_clustering.png")
 
 # %% [markdown]
 # ## Finalização de relatório com as saídas obtidas
@@ -1581,8 +1767,9 @@ try:
     create_title_page("Cruzamento com MapBiomas", relatorio)
     relatorio.savefig(fig_mapbiomas, bbox_inches='tight')
 
-    create_title_page("Séries Temporais (NDVI)", relatorio)
-    relatorio.savefig(fig_time_series, bbox_inches='tight')
+    create_title_page("Séries Temporais (NDVI) por Ponto", relatorio)
+    for fig_ts in vetor_figs_time_series:
+        relatorio.savefig(fig_ts, bbox_inches='tight')
 
     create_title_page("Métricas Fenológicas para Pontos Aleatórios", relatorio)
     for fig_phenometrics in vetor_figs_phenometrics:
@@ -1591,13 +1778,17 @@ try:
     create_title_page("Recortes de Imagens e Estatísticas Temporais", relatorio)
     relatorio.savefig(fig_clips_estatisticas, bbox_inches='tight')
 
+    create_title_page("Composição RGB (sem máscara de nuvens)", relatorio)
+    if 'fig_rgb_clips' in locals():
+        relatorio.savefig(fig_rgb_clips, bbox_inches='tight')
+
     create_title_page("Índice de Vegetação Realçado (EVI)", relatorio)
     if 'fig_evi_clips' in locals():
         relatorio.savefig(fig_evi_clips, bbox_inches='tight')
 
     create_title_page("Agrupamento por Mapas Auto-Organizáveis (SOM)", relatorio)
     relatorio.savefig(fig_som_profiles, bbox_inches='tight')
-    relatorio.savefig(fig_som_neuron_map, bbox_inches='tight')
+    #relatorio.savefig(fig_som_neuron_map, bbox_inches='tight')
     relatorio.savefig(fig_som_u_matrix, bbox_inches='tight')
     relatorio.savefig(fig_som_clustering, bbox_inches='tight')
 finally:
@@ -1608,7 +1799,7 @@ metadados['Title'] = f'Relatório sobre gleba {ref_bacen}, entre {data_inicial} 
 metadados['Author'] = 'Geo Crédito Rural'
 metadados['Subject'] = 'Cruzamento com séries temporais e estatísticas'
 metadados['Keywords'] = 'gleba, crédito rural, proagro, sicor, sentinel, cbers'
-metadados['CreationDate'] = datetime.datetime.today()
+metadados['CreationDate'] = datetime.today()
 
 relatorio.close()
 

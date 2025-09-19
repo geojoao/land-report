@@ -1,5 +1,5 @@
 [project]
-name = "bacen-report-app"
+name = "bacen-report"
 version = "0.1.0"
 description = "A Dockerized application to generate BACEN reports from SICOR data."
 requires-python = "==3.10.*"
@@ -26,5 +26,6 @@ dependencies = [
     "dask",
     "odc-stac",
     "bottleneck",
-    "salem"
+    "jupyter",
+    "papermill"
 ]
