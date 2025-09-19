@@ -84,7 +84,7 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 
 def print_status(message):
     """Prints a message to stderr to show in the console but not in the report."""
-    print(message, file=sys.stderr)
+    print(message, file=sys.stderr, flush=True)
 
 
 def recursive_extract(elem, ns, prefix=''):
@@ -493,7 +493,7 @@ try:
     print_status("1. Lendo XML e criando GeoDataFrame...")
     gdf = parse_xml_to_gdf_all_fields(xml_content)
 except FileNotFoundError:
-    print_status("ERRO: O arquivo 'locks.xml' não foi encontrado.")
+    print_status(f"ERRO: O arquivo {ref_bacen}.xml não foi encontrado.")
     sys.exit(1)
 
 # Carrega apenas o município que cruza com a gleba, economizando memória.

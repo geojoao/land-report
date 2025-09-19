@@ -46,8 +46,9 @@ ENV PATH="/routine/.venv/bin:${PATH}"
 
 # Copy your application's code and data into the container
 COPY bacen_report.py .
+COPY routine.py .
 COPY bocom_bbm_report.qmd .
-COPY locks.xml .
+COPY 513438999.xml .
 
-# Comando para renderizar o documento Quarto para PDF quando o contêiner for iniciado
-CMD ["quarto", "render", "bocom_bbm_report.qmd", "--to", "pdf"]
+# Comando para executar o script Python que renderiza o documento Quarto.
+CMD ["python", "routine.py"]
