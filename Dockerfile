@@ -39,13 +39,15 @@ COPY pyproject.toml .
 RUN pip install --no-cache-dir "uv>=0.1.17"
 RUN pip install papermill
 RUN uv sync
+RUN uv run python -m ipykernel install --user --name sicor-bacen --display-name "Python (SICOR BACEN)"
+
 
 # Add the virtual environment's bin directory to the PATH
 # This ensures that Quarto uses the Python from the .venv
 ENV PATH="/routine/.venv/bin:${PATH}"
 
 # Copy your application's code and data into the container
-COPY bacen_report.py .
+COPY _extensions/ ./_extensions/
 COPY routine.py .
 COPY bocom_bbm_report.qmd .
 COPY 513438999.xml .

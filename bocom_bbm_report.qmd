@@ -3,34 +3,18 @@ title: "Relatório de Monitoramento de Operações de Crédito de Custeio"
 subtitle: "Análise da Gleba REF_BACEN: {ref_bacen}"
 author: "BOCOM BBM"
 date: "today"
-format:
-  html:
-    theme: litera
-    toc: true
-    toc-location: left
-    toc-title: "Seções do Relatório"
-    number-sections: true
-    code-fold: true
-    code-summary: "Mostrar/Ocultar Código"
-    grid:
-      sidebar-width: 250px
-      body-width: 900px
-      margin-width: 250px
-  pdf:
-    documentclass: scrartcl
-    papersize: a4
-    toc: true
-    number-sections: true
-    fig-cap-location: top
+format: PrettyPDF-pdf
 lang: pt
 execute:
   echo: false
   warning: false
+jupyter: sicor-bacen
 params:
   ref_bacen: 513438999
   start_date: '2022-01-01'
   end_date: '2022-12-31'
 ---
+
 
 ```{python}
 #| tags: [parameters]
@@ -86,6 +70,72 @@ def print_status(message):
     """Prints a message to stderr to show in the console but not in the report."""
     print(message, file=sys.stderr, flush=True)
 
+def parse_operation_details_from_xml(xml_string):
+    """
+    Parses a COR0001 XML string to extract structured details about
+    financing destinations and associated properties (matricules).
+    """
+    ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
+    root = ET.fromstring(xml_string)
+    
+    cor_element = root.find('.//ns:COR0001', ns)
+    if cor_element is None:
+        return {"error": "Elemento COR0001 não encontrado no XML."}
+
+    def find_text(element, path):
+        node = element.find(path, ns)
+        return node.text.strip() if node is not None and node.text else "N/A"
+
+    general_info = {
+        "Número de Controle IF": find_text(cor_element, 'ns:NumCtrlIF'),
+        "CNPJ da Entidade Responsável": find_text(cor_element, 'ns:CNPJEntRespons'),
+        "Data de Emissão": find_text(cor_element, 'ns:DtEms'),
+        "Data de Vencimento": find_text(cor_element, 'ns:DtVenc'),
+        "Valor Total da Operação": find_text(cor_element, 'ns:VlrTotOp'),
+        "Data do Movimento": find_text(cor_element, 'ns:DtMovto'),
+    }
+
+    destinations = []
+    for dest_elem in cor_element.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
+        dest_info = {
+            "Código do Empreendimento": find_text(dest_elem, 'ns:CodEmpnmnt'),
+            "Valor da Parcela de Crédito": find_text(dest_elem, 'ns:VlrParclCred'),
+            "Início do Plantio": find_text(dest_elem, 'ns:DtIniPlant'),
+            "Fim do Plantio": find_text(dest_elem, 'ns:DtFimPlant'),
+            "Início da Colheita": find_text(dest_elem, 'ns:DtIniColht'),
+            "Fim da Colheita": find_text(dest_elem, 'ns:DtFimColht'),
+            "Receita Bruta Esperada": find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt'),
+        }
+
+        properties = []
+        for prop_elem in dest_elem.findall('ns:Grupo_COR0001_Propt', ns):
+            prop_details = {
+                "NIRF": find_text(prop_elem, 'ns:NIRF'),
+                "Código SNCR": find_text(prop_elem, 'ns:CodSNCR'),
+                "Número CAR": find_text(prop_elem, 'ns:NumRegCAR'),
+            }
+            properties.append(prop_details)
+        
+        dest_info["properties"] = properties
+        destinations.append(dest_info)
+
+    return {"general_info": general_info, "destinations": destinations}
+
+def dataframe_to_markdown(df, show_index=True):
+    """
+    Converts a pandas DataFrame to a markdown table string without
+    requiring the 'tabulate' library.
+    """
+    header = "|"
+    separator = "|"
+    if show_index:
+        header += f" {df.index.name or ''} |"
+        separator += " --- |"
+    header += " | ".join(df.columns) + " |"
+    separator += " --- |" * len(df.columns)
+    
+    body = "\n".join([f"| {(f'{i} | ' if show_index else '')}{' | '.join(map(str, row))} |" for i, row in df.iterrows()])
+    return f"{header}\n{separator}\n{body}"
 
 def recursive_extract(elem, ns, prefix=''):
     """Recursively extract text from XML elements into a flat dict."""
@@ -473,6 +523,81 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
 # Resumo da Análise
 
 Este relatório apresenta uma análise geotecnológica de uma gleba rural, parte do processo de monitoramento de operações de crédito de custeio. O script parte de um polígono de uma gleba, obtendo informações sobre a mesma, e realiza o cruzamento com dados de mapas de uso e cobertura da terra, observação de séries temporais pontuais e por sub-regiões homogêneas, e finaliza com a apresentação de estatísticas dos recortes das imagens ao longo do tempo.
+
+# Detalhes da Operação e Matrículas
+
+Esta seção apresenta os dados gerais da operação de crédito rural e os detalhes de cada empreendimento financiado, incluindo as informações das matrículas associadas (CAR, NIRF) e os cronogramas agrícolas.
+
+```{python}
+#| results: "asis"
+#| tbl-cap-location: top
+#| #| echo: false
+
+# Carregamento do XML e criação do GeoDataFrame
+# Este bloco carrega e processa os dados do XML, mas não produz output visível.
+# As variáveis `gdf` e `parsed_data` ficam disponíveis para os blocos seguintes.
+try:
+    with open(f'{ref_bacen}.xml', 'r', encoding='utf-8') as f:
+        xml_content = f.read()
+except FileNotFoundError:
+    print_status(f"ERRO: O arquivo {ref_bacen}.xml não foi encontrado.")
+    sys.exit(1)
+    xml_content = None
+
+if xml_content:
+    gdf = parse_xml_to_gdf_all_fields(xml_content)
+    parsed_data = parse_operation_details_from_xml(xml_content)
+else:
+    gdf = None
+    parsed_data = {}
+```
+
+### Resumo da Operação
+
+```{python}
+#| tbl-cap: "Resumo Geral da Operação de Crédito"
+
+from IPython.display import display, Markdown
+from tabulate import tabulate
+
+# Example: general info table
+if "general_info" in parsed_data:
+    # Convert dict to list of [attribute, value]
+    table_data = [[k, v] for k, v in parsed_data["general_info"].items()]
+
+    # Create Markdown table
+    markdown_table = tabulate(
+        table_data,
+        headers=["Atributo", "Valor"],
+        tablefmt="pipe"
+    )
+    display(Markdown(markdown_table))
+```
+
+
+### Detalhes por Empreendimento
+
+```{python}
+from tabulate import tabulate
+from IPython.display import display, Markdown
+
+if "destinations" in parsed_data:
+    for i, dest in enumerate(parsed_data["destinations"]):
+        display(Markdown(f"#### Empreendimento {i+1} (Código: {dest['Código do Empreendimento']})"))
+        
+        # Detalhes do empreendimento
+        dest_details = [[k, v] for k, v in dest.items() if k != "properties"]
+        markdown_table_dest = tabulate(dest_details, headers=["Atributo", "Valor"], tablefmt="pipe")
+        display(Markdown(f'{markdown_table_dest}\n\n: Detalhes do Empreendimento {i+1}'))
+        
+        # Matrículas associadas
+        if dest["properties"]:
+            display(Markdown("##### Matrículas Associadas"))
+            matr_data = [list(d.values()) for d in dest["properties"]]
+            headers = list(dest["properties"][0].keys())
+            markdown_table_matr = tabulate(matr_data, headers=headers, tablefmt="pipe")
+            display(Markdown(f'{markdown_table_matr}\n\n: Matrículas Associadas ao Empreendimento {i+1}'))
+```
 
 ```{python}
 #| echo: false

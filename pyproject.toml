@@ -27,5 +27,7 @@ dependencies = [
     "odc-stac",
     "bottleneck",
     "jupyter",
-    "papermill"
+    "papermill",
+    "azure-storage-blob",
+    "tabulate"
 ]

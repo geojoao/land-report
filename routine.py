@@ -7,6 +7,8 @@ def run_quarto_render():
     and streams its output to the console in real-time.
     """
     command = [
+        "uv",
+        "run",
         "quarto",
         "render",
         "bocom_bbm_report.qmd",
