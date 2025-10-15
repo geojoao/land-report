@@ -10,7 +10,8 @@ execute:
   warning: false
 jupyter: sicor-bacen
 params:
-  ref_bacen: 513438999
+  produtor: "Straglioto"
+  ref_bacen: "513438999"
   start_date: '2022-01-01'
   end_date: '2022-12-31'
 ---
@@ -20,7 +21,8 @@ params:
 #| tags: [parameters]
 #| include: false
 
-ref_bacen = 513438999
+produtor = "Straglioto"
+ref_bacen = "513438999"
 start_date = '2022-01-01'
 end_date = '2022-12-31'
 ```
@@ -520,13 +522,6 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
 
 ```
 
-# Resumo da Análise
-
-Este relatório apresenta uma análise geotecnológica de uma gleba rural, parte do processo de monitoramento de operações de crédito de custeio. O script parte de um polígono de uma gleba, obtendo informações sobre a mesma, e realiza o cruzamento com dados de mapas de uso e cobertura da terra, observação de séries temporais pontuais e por sub-regiões homogêneas, e finaliza com a apresentação de estatísticas dos recortes das imagens ao longo do tempo.
-
-# Detalhes da Operação e Matrículas
-
-Esta seção apresenta os dados gerais da operação de crédito rural e os detalhes de cada empreendimento financiado, incluindo as informações das matrículas associadas (CAR, NIRF) e os cronogramas agrícolas.
 
 ```{python}
 #| results: "asis"
@@ -552,7 +547,7 @@ else:
     parsed_data = {}
 ```
 
-### Resumo da Operação
+# Dados Cadastrais
 
 ```{python}
 #| tbl-cap: "Resumo Geral da Operação de Crédito"
@@ -560,22 +555,46 @@ else:
 from IPython.display import display, Markdown
 from tabulate import tabulate
 
-# Example: general info table
-if "general_info" in parsed_data:
-    # Convert dict to list of [attribute, value]
-    table_data = [[k, v] for k, v in parsed_data["general_info"].items()]
 
-    # Create Markdown table
-    markdown_table = tabulate(
-        table_data,
-        headers=["Atributo", "Valor"],
-        tablefmt="pipe"
-    )
-    display(Markdown(markdown_table))
+area_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+property_aea = gdf.to_crs(area_proj)
+area_ha = property_aea[['geometry']].geometry.area.sum() / 10000
+
+codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252')
+
+empreendimento_df = codempreendimento_df[codempreendimento_df['#CODIGO']==12010560176011]
+
+dados_cadastrais_df = {
+    'Instituição Financeira': 'BOCOM BBM',
+    'Produtor': produtor,
+    'CPF / CNPJ': gdf['Grupo_COR0001_Benfcrio_CNPJ_CPFBenfcrio'].iloc[0],
+    'REFBACEN': ref_bacen,
+    'Empreendimento': '{produto} | {variedade} | {cesta}'.format(
+        produto=empreendimento_df['PRODUTO'].values[0],
+        variedade=empreendimento_df['VARIEDADE'].values[0],
+        cesta=empreendimento_df['CESTA'].values[0]
+        ),
+    'Área Financiada (ha)': area_ha,
+    'Expectativa de produtividade (Kg/ha)': (gdf['Grupo_COR0001_DestcFincmnt_QtdPrvProdc'].astype(float).sum()/1000)/area_ha,
+    'Expectativa de produção (ton)': gdf['Grupo_COR0001_DestcFincmnt_QtdPrvProdc'].astype(float).sum(),
+    'Receita esperada do empreendimento (BRL)':gdf['Grupo_COR0001_DestcFincmnt_VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum()
+}
+
+
+# Convert dict to list of [attribute, value]
+table_data = [[k, v] for k, v in dados_cadastrais_df.items()]
+
+# Create Markdown table
+markdown_table = tabulate(
+    table_data,
+    headers=["Campo", "Informação"],
+    tablefmt="pipe"
+)
+display(Markdown(markdown_table))
 ```
 
 
-### Detalhes por Empreendimento
+# Detalhes por Empreendimento
 
 ```{python}
 from tabulate import tabulate

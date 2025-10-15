@@ -6,13 +6,14 @@ def run_quarto_render():
     Executes the Quarto render command for the BOCOM BBM report
     and streams its output to the console in real-time.
     """
+    # uv run quarto render bocom_bbm_report.qmd --to PrettyPDF-pdf -P ref_bacen:513438999 -P start_date:'2023-01-01' -P end_date:'2023-12-31'
     command = [
         "uv",
         "run",
         "quarto",
         "render",
         "bocom_bbm_report.qmd",
-        "--to", "pdf",
+        "--to", "PrettyPDF-pdf",
         "-P", "ref_bacen:513438999",
         "-P", "start_date:'2023-01-01'",
         "-P", "end_date:'2023-12-31'"
