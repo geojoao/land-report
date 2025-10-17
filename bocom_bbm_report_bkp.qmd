@@ -3,41 +3,26 @@ title: "Relatório de Monitoramento de Operações de Crédito de Custeio"
 subtitle: "Análise da Gleba REF_BACEN: {ref_bacen}"
 author: "BOCOM BBM"
 date: "today"
-format:
-  html:
-    theme: litera
-    toc: true
-    toc-location: left
-    toc-title: "Seções do Relatório"
-    number-sections: true
-    code-fold: true
-    code-summary: "Mostrar/Ocultar Código"
-    grid:
-      sidebar-width: 250px
-      body-width: 900px
-      margin-width: 250px
-  pdf:
-    documentclass: scrartcl
-    papersize: a4
-    toc: true
-    number-sections: true
-    fig-cap-location: top
+format: PrettyPDF-pdf
 lang: pt
 execute:
   echo: false
   warning: false
 jupyter: sicor-bacen
 params:
-  ref_bacen: 513438999
+  produtor: "Straglioto"
+  ref_bacen: "513438999"
   start_date: '2022-01-01'
   end_date: '2022-12-31'
 ---
+
 
 ```{python}
 #| tags: [parameters]
 #| include: false
 
-ref_bacen = 513438999
+produtor = "Straglioto"
+ref_bacen = "513438999"
 start_date = '2022-01-01'
 end_date = '2022-12-31'
 ```
@@ -55,38 +40,41 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 import contextily as ctx
-
+ 
 import matplotlib.patches as mpatches
 import matplotlib.image as mpimg
 from datetime import datetime
-
+ 
 from sqlalchemy import create_engine
-
+ 
 from pystac_client import Client
 import pystac_client
 import shapely
-
+ 
 import wtss
 from shapely.geometry import Polygon, Point
 import random
 from wcpms import *
-
+ 
 from skimage.transform import resize
-
+ 
 import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import kaleido
-
+ 
 import xml.etree.ElementTree as ET
+import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon
+ 
 import requests, zipfile, io
-
+ 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-
+ 
 def print_status(message):
     """Prints a message to stderr to show in the console but not in the report."""
     print(message, file=sys.stderr, flush=True)
-
+ 
 def parse_operation_details_from_xml(xml_string):
     """
     Parses a COR0001 XML string to extract structured details about
@@ -94,15 +82,15 @@ def parse_operation_details_from_xml(xml_string):
     """
     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
     root = ET.fromstring(xml_string)
-    
+   
     cor_element = root.find('.//ns:COR0001', ns)
     if cor_element is None:
         return {"error": "Elemento COR0001 não encontrado no XML."}
-
+ 
     def find_text(element, path):
         node = element.find(path, ns)
         return node.text.strip() if node is not None and node.text else "N/A"
-
+ 
     general_info = {
         "Número de Controle IF": find_text(cor_element, 'ns:NumCtrlIF'),
         "CNPJ da Entidade Responsável": find_text(cor_element, 'ns:CNPJEntRespons'),
@@ -111,7 +99,7 @@ def parse_operation_details_from_xml(xml_string):
         "Valor Total da Operação": find_text(cor_element, 'ns:VlrTotOp'),
         "Data do Movimento": find_text(cor_element, 'ns:DtMovto'),
     }
-
+ 
     destinations = []
     for dest_elem in cor_element.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
         dest_info = {
@@ -123,7 +111,7 @@ def parse_operation_details_from_xml(xml_string):
             "Fim da Colheita": find_text(dest_elem, 'ns:DtFimColht'),
             "Receita Bruta Esperada": find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt'),
         }
-
+ 
         properties = []
         for prop_elem in dest_elem.findall('ns:Grupo_COR0001_Propt', ns):
             prop_details = {
@@ -132,12 +120,12 @@ def parse_operation_details_from_xml(xml_string):
                 "Número CAR": find_text(prop_elem, 'ns:NumRegCAR'),
             }
             properties.append(prop_details)
-        
+       
         dest_info["properties"] = properties
         destinations.append(dest_info)
-
+ 
     return {"general_info": general_info, "destinations": destinations}
-
+ 
 def dataframe_to_markdown(df, show_index=True):
     """
     Converts a pandas DataFrame to a markdown table string without
@@ -150,10 +138,10 @@ def dataframe_to_markdown(df, show_index=True):
         separator += " --- |"
     header += " | ".join(df.columns) + " |"
     separator += " --- |" * len(df.columns)
-    
+   
     body = "\n".join([f"| {(f'{i} | ' if show_index else '')}{' | '.join(map(str, row))} |" for i, row in df.iterrows()])
     return f"{header}\n{separator}\n{body}"
-
+ 
 def recursive_extract(elem, ns, prefix=''):
     """Recursively extract text from XML elements into a flat dict."""
     data = {}
@@ -166,22 +154,67 @@ def recursive_extract(elem, ns, prefix=''):
         else:
             data.update(recursive_extract(child, ns, key))
     return data
+ 
+# def parse_xml_to_gdf_all_fields(xml_string):
+#     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
+#     root = ET.fromstring(xml_string)
+   
+#     cor = root.find('.//ns:COR0001', ns)
+#     if cor is None:
+#         raise ValueError("No COR0001 element found in XML")
+   
+#     data = recursive_extract(cor, ns)
+   
+#     polygon_points = []
+#     destc = cor.find('ns:Grupo_COR0001_DestcFincmnt', ns)
+#     if destc is not None:
+#         gleba = destc.find('ns:Grupo_COR0001_Gleba', ns)
+#         if gleba is not None:
+#             for pt in gleba.findall('ns:Grupo_COR0001_PontoPolg', ns):
+#                 lat = pt.find('ns:LatPonto', ns)
+#                 lon = pt.find('ns:LongPonto', ns)
+#                 if lat is not None and lon is not None:
+#                     try:
+#                         lat_f = float(lat.text.strip())
+#                         lon_f = float(lon.text.strip())
+#                         polygon_points.append((lon_f, lat_f))
+#                     except Exception:
+#                         pass
+   
+#     if not polygon_points:
+#         raise ValueError("No polygon points found in XML")
+   
+#     polygon = Polygon(polygon_points)
+#     gdf = gpd.GeoDataFrame([data], geometry=[polygon], crs="EPSG:4326")
+#     return gdf
 
 def parse_xml_to_gdf_all_fields(xml_string):
     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
     root = ET.fromstring(xml_string)
-    
+   
     cor = root.find('.//ns:COR0001', ns)
     if cor is None:
         raise ValueError("No COR0001 element found in XML")
-    
+   
+    # Assuming recursive_extract extracts all fields from cor element except geometry
     data = recursive_extract(cor, ns)
-    
+   
+    data_ = {x:data[x] for x in data if 'Grupo_COR0001_DestcFincmnt' not in x}
+   
     polygon_points = []
-    destc = cor.find('ns:Grupo_COR0001_DestcFincmnt', ns)
-    if destc is not None:
-        gleba = destc.find('ns:Grupo_COR0001_Gleba', ns)
-        if gleba is not None:
+
+    # Prepare list to hold rows for GeoDataFrame
+    rows = []
+   
+    # Iterate over all Grupo_COR0001_DestcFincmnt elements (credit operations)
+    for destc in cor.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
+        # Extract data for this credit operation (you may want to extract specific fields here)
+        destc_data = recursive_extract(destc, ns)
+       
+        polygons = []
+        # Iterate over all glebas (land parcels) inside this credit operation
+        for gleba in destc.findall('ns:Grupo_COR0001_Gleba', ns):
+            polygon_points = []
             for pt in gleba.findall('ns:Grupo_COR0001_PontoPolg', ns):
                 lat = pt.find('ns:LatPonto', ns)
                 lon = pt.find('ns:LongPonto', ns)
@@ -192,35 +225,56 @@ def parse_xml_to_gdf_all_fields(xml_string):
                         polygon_points.append((lon_f, lat_f))
                     except Exception:
                         pass
-    
-    if not polygon_points:
-        raise ValueError("No polygon points found in XML")
-    
-    polygon = Polygon(polygon_points)
-    gdf = gpd.GeoDataFrame([data], geometry=[polygon], crs="EPSG:4326")
-    return gdf
+            if polygon_points:
+                # Close polygon if not closed
+                if polygon_points[0] != polygon_points[-1]:
+                    polygon_points.append(polygon_points[0])
+                polygons.append(Polygon(polygon_points))
+       
+        if not polygons:
+            # Skip if no polygons found for this credit operation
+            continue
+       
+        # Combine polygons into a MultiPolygon if more than one
+        if len(polygons) == 1:
+            geometry = polygons[0]
+        else:
+            geometry = MultiPolygon(polygons)
 
+        destc_data.update(data_)
+
+        # Combine destc_data and geometry into one dict for GeoDataFrame row
+        row = destc_data.copy()
+        row['geometry'] = geometry
+        rows.append(row)
+   
+    if not rows:
+        raise ValueError("No credit operations with land parcels found in XML")
+   
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    return gdf
+ 
 try:
     from matplotlib_scalebar.scalebar import ScaleBar
 except ImportError:
     ScaleBar = None
-
+ 
 def load_ibge_municipalities(bbox=None):
     """
     Downloads, extracts, and loads IBGE municipalities, optionally filtered by a bounding box.
     Filtering by bbox significantly reduces memory usage.
     """
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_Municipios_2024.zip"
-    
+   
     # Construct a fsspec-compatible URI to read the shapefile directly from the zip
     # This is the most robust and memory-efficient way.
     uri = f"zip+{url}!BR_Municipios_2024.shp"
-
+ 
     gdf = gpd.read_file(uri, bbox=bbox)
     gdf = gdf.to_crs("EPSG:4326")
     return gdf
-
-
+ 
+ 
 def load_ibge_states():
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip"
     r = requests.get(url)
@@ -230,7 +284,7 @@ def load_ibge_states():
     gdf = gpd.read_file(f"ibge_states/{shp_path}")
     gdf = gdf.to_crs("EPSG:4326")
     return gdf
-
+ 
 def plot_rural_property(property_gdf, municipalities_gdf=None):
     centroid = property_gdf.geometry.centroid.iloc[0]
     lon, lat = centroid.x, centroid.y
@@ -256,14 +310,14 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
     area_ha = property_aea.geometry.area.iloc[0] / 10000
     area_m2 = property_aea.geometry.area.iloc[0]
     perimeter_m = property_aea.geometry.length.iloc[0]
-
+ 
     # Calculate additional metrics
     pa_ratio = perimeter_m / area_m2 if area_m2 > 0 else 0
     circle = property_gdf.minimum_bounding_circle().to_crs(brazil_aea_proj)
     circle_ratio = area_m2 / circle.geometry.area.iloc[0] if not circle.empty and circle.geometry.area.iloc[0] > 0 else 0
     rect = property_aea.geometry.iloc[0].minimum_rotated_rectangle
     rect_ratio = area_m2 / rect.area if rect.area > 0 else 0
-
+ 
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off")
     table_data = [
@@ -291,17 +345,17 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         ax_mini.spines['top'].set_visible(True); ax_mini.spines['right'].set_visible(True); ax_mini.spines['bottom'].set_visible(True); ax_mini.spines['left'].set_visible(True)
         ax_mini.set_axis_off()
     return fig
-
+ 
 import rioxarray
 import shapely.geometry
 import numpy as np
 import pyproj
 from shapely.ops import transform
-
+ 
 def reproject_geom(geom, src_crs, dst_crs):
     project = pyproj.Transformer.from_crs(src_crs, dst_crs, always_xy=True).transform
     return transform(project, geom)
-
+ 
 def clip_cog_raster_by_polygon(polygon, raster_cog_path):
     raster = rioxarray.open_rasterio(raster_cog_path, masked=True).squeeze(dim='band')
     raster_crs = raster.rio.crs
@@ -329,7 +383,7 @@ def clip_cog_raster_by_polygon(polygon, raster_cog_path):
     else:
         bbox_4326 = bounds_proj
     return clipped, bbox_4326
-
+ 
 def plot(imagem_cortada, bbox, classes_df, largura_figuras=10):
     fig, ax = plt.subplots(figsize=(largura_figuras, 4))
     data = imagem_cortada.values
@@ -357,7 +411,7 @@ def plot(imagem_cortada, bbox, classes_df, largura_figuras=10):
     ax.set_title('Raster Plot with Legend')
     fig.tight_layout(rect=[0, 0, 0.85, 1])
     return fig, ax
-
+ 
 def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     gs = gpd.GeoSeries([geometry_4326], crs="EPSG:4326")
     utm_crs = gs.estimate_utm_crs()
@@ -370,12 +424,12 @@ def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     points_gdf_proj = gpd.GeoDataFrame(geometry=points_proj, crs=utm_crs)
     points_gdf_4326 = points_gdf_proj.to_crs("EPSG:4326")
     return list(points_gdf_4326.geometry)
-
+ 
 import rasterio
 from rasterio.mask import mask
 from rasterio.errors import RasterioIOError
 from rasterio._err import CPLE_AppDefinedError
-
+ 
 def retry_rasterio_open(href, max_retries=5, delay=15):
     for attempt in range(max_retries):
         try:
@@ -387,7 +441,7 @@ def retry_rasterio_open(href, max_retries=5, delay=15):
                 time.sleep(delay)
             else: raise
     raise RasterioIOError(f"Failed to open {href} after {max_retries} attempts.")
-
+ 
 def carregar_banda_sentinel2_bdc(item, banda, gleba):
     asset = item.assets.get(banda)
     if asset is None: raise ValueError(f"Band {banda} not found in item assets.")
@@ -396,7 +450,7 @@ def carregar_banda_sentinel2_bdc(item, banda, gleba):
         geoms = [feature["geometry"] for feature in gleba_proj.__geo_interface__["features"]] if hasattr(gleba_proj, "__geo_interface__") else [gleba_proj.geometry]
         out_image, out_transform = mask(src, geoms, crop=True)
         return out_image[0].astype(np.float32)
-
+ 
 def carregar_banda_sentinel2_bdc_scl(item, banda, gleba, banda_scl_zoom):
     banda_array = carregar_banda_sentinel2_bdc(item, banda, gleba)
     if banda_array.shape != banda_scl_zoom.shape:
@@ -404,19 +458,19 @@ def carregar_banda_sentinel2_bdc_scl(item, banda, gleba, banda_scl_zoom):
     cloud_classes = [3, 7, 8, 9, 10, 11]
     mask_clouds = np.isin(banda_scl_zoom, cloud_classes)
     return np.where(mask_clouds, np.nan, banda_array)
-
+ 
 def normalizar(array, L):
     arr_min, arr_max = np.nanmin(array), np.nanmax(array)
     if arr_max - arr_min == 0: return np.zeros_like(array)
     return (array - arr_min) / (arr_max - arr_min) * L
-
+ 
 def aplicar_contraste_raiz(array, L, N):
     return np.power(array / L, 1/N) * L
-
+ 
 import pystac_client, rioxarray, xarray as xr, dask.diagnostics
 from odc.stac import stac_load
 import dask
-
+ 
 def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, resolution=10):
     print_status("   - Opening STAC catalog and searching for items...")
     catalog = pystac_client.Client.open(stac_url)
@@ -448,10 +502,10 @@ def process_cube(shapefile, query_bands, start_date, end_date, collections, stac
     masked_bands = {band: da.where(spatial_mask, -1) for band, da in final_cube.data_vars.items()}
     final_cube = xr.Dataset(masked_bands, coords=final_cube.coords)
     return final_cube.compute(), spatial_mask.compute()
-
+ 
 from sklearn.preprocessing import StandardScaler
 from minisom import MiniSom
-
+ 
 def som_time_series_clustering(cube, mask, n=2, random_seed=123, training_steps=100):
     cube_da = cube['NDVI']
     data = cube_da.transpose('y', 'x', 'time').values
@@ -474,7 +528,7 @@ def som_time_series_clustering(cube, mask, n=2, random_seed=123, training_steps=
     predictions[mask_flat] = predictions_valid
     predictions = predictions.reshape(mask.shape)
     return predictions, neuron_weights, predictions, som
-
+ 
 def plot_som_u_matrix(som, cmap='viridis_r'):
     from matplotlib.patheffects import withStroke
     u_matrix = som.distance_map()
@@ -492,13 +546,13 @@ def plot_som_u_matrix(som, cmap='viridis_r'):
             cluster_index = i * som_y + j
             ax.text(j, i, str(cluster_index), ha='center', va='center', color=text_colors[i, j], fontweight='bold', path_effects=path_effects)
     return fig, ax
-
+ 
 def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 6))
     else:
         fig = ax.get_figure()
-
+ 
     da = cube[band_name]
     cluster_ids = np.unique(predictions[predictions >= 0])
     for cluster_id in cluster_ids:
@@ -507,13 +561,13 @@ def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
     ax.set_xlabel('Time'); ax.set_ylabel(band_name); ax.legend()
     ax.set_title('Perfis Médios de NDVI por Cluster')
     return fig, ax
-
+ 
 def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 6))
     else:
         fig = ax.get_figure()
-
+ 
     masked_preds = np.ma.masked_equal(predictions, -1)
     valid_clusters = np.unique(masked_preds.compressed())
     if len(valid_clusters) > 0:
@@ -525,7 +579,7 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
             cmap = plt.get_cmap(cmap, n_clusters)
         bounds = np.arange(min_pred, max_pred + 2) - 0.5
         norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
-    
+   
     cmap_copy = cmap.copy()
     cmap_copy.set_bad("white")
     im = ax.imshow(masked_preds, cmap=cmap_copy, norm=norm, interpolation="none")
@@ -537,13 +591,6 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
 
 ```
 
-# Resumo da Análise
-
-Este relatório apresenta uma análise geotecnológica de uma gleba rural, parte do processo de monitoramento de operações de crédito de custeio. O script parte de um polígono de uma gleba, obtendo informações sobre a mesma, e realiza o cruzamento com dados de mapas de uso e cobertura da terra, observação de séries temporais pontuais e por sub-regiões homogêneas, e finaliza com a apresentação de estatísticas dos recortes das imagens ao longo do tempo.
-
-# Detalhes da Operação e Matrículas
-
-Esta seção apresenta os dados gerais da operação de crédito rural e os detalhes de cada empreendimento financiado, incluindo as informações das matrículas associadas (CAR, NIRF) e os cronogramas agrícolas.
 
 ```{python}
 #| results: "asis"
@@ -569,7 +616,7 @@ else:
     parsed_data = {}
 ```
 
-### Resumo da Operação
+# Dados Cadastrais
 
 ```{python}
 #| tbl-cap: "Resumo Geral da Operação de Crédito"
@@ -577,26 +624,53 @@ else:
 from IPython.display import display, Markdown
 from tabulate import tabulate
 
-# Example: general info table
-if "general_info" in parsed_data:
-    # Convert dict to list of [attribute, value]
-    table_data = [[k, v] for k, v in parsed_data["general_info"].items()]
 
-    # Create Markdown table
-    markdown_table = tabulate(
-        table_data,
-        headers=["Atributo", "Valor"],
-        tablefmt="pipe"
-    )
-    display(Markdown(markdown_table))
+area_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+property_aea = gdf.to_crs(area_proj)
+area_ha = property_aea[['geometry']].dissolve().geometry.area.sum() / 10000
+
+dados_cadastrais_df = {
+    'Instituição Financeira': 'BOCOM BBM',
+    'Produtor': produtor,
+    'CPF / CNPJ': gdf['Grupo_COR0001_Benfcrio_CNPJ_CPFBenfcrio'].iloc[0],
+    'REFBACEN': ref_bacen,
+    #'Empreendimento': '{produto} | {variedade} | {cesta}'.format(
+    #    produto=empreendimento_df['PRODUTO'].values[0],
+    #    variedade=empreendimento_df['VARIEDADE'].values[0],
+    #    cesta=empreendimento_df['CESTA'].values[0]
+    #    ),
+    'Área Financiada (ha)': area_ha,
+    #'Expectativa de produtividade (Kg/ha)': (gdf['QtdPrvProdc'].astype(float).sum()/1000)/area_ha,
+    #'Expectativa de produção (ton)': gdf['QtdPrvProdc'].astype(float).sum(),
+    'Receita esperada do empreendimento (BRL)':gdf['VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum()
+}
+
+# Convert dict to list of [attribute, value]
+table_data = [[k, v] for k, v in dados_cadastrais_df.items()]
+
+# Create Markdown table
+markdown_table = tabulate(
+    table_data,
+    headers=["Campo", "Informação"],
+    tablefmt="pipe"
+)
+display(Markdown(markdown_table))
 ```
 
 
-### Detalhes por Empreendimento
+# Detalhes por Empreendimento
 
 ```{python}
 from tabulate import tabulate
 from IPython.display import display, Markdown
+
+codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252').rename(columns={'#CODIGO':'Código do Empreendimento'})
+
+codempreendimento_df['Código do Empreendimento'] = codempreendimento_df['Código do Empreendimento'].astype(str)
+
+
+parsed_data["destinations"] = pd.DataFrame(parsed_data["destinations"]).merge(codempreendimento_df, how='left', on='Código do Empreendimento').to_dict(orient='records')
+
 
 if "destinations" in parsed_data:
     for i, dest in enumerate(parsed_data["destinations"]):
@@ -619,6 +693,8 @@ if "destinations" in parsed_data:
 ```{python}
 #| echo: false
 
+glebas_gdf = gdf.explode().head(1)
+
 # Constantes do script
 grid_spacing_meters = 1000
 largura_figuras = 18
@@ -628,23 +704,13 @@ bdc_wcpms_url = 'https://data.inpe.br/bdc/wcpms'
 colecao_s2 = 'S2-16D-2'
 colecao_cbers = 'CBERS4-WFI-16D-2'
 
-# Carregamento dos dados da gleba e fontes auxiliares
-try:
-    with open(f'{ref_bacen}.xml', 'r', encoding='utf-8') as f:
-        xml_content = f.read()
-    print_status("1. Lendo XML e criando GeoDataFrame...")
-    gdf = parse_xml_to_gdf_all_fields(xml_content)
-except FileNotFoundError:
-    print_status(f"ERRO: O arquivo {ref_bacen}.xml não foi encontrado.")
-    sys.exit(1)
-
 # Carrega apenas o município que cruza com a gleba, economizando memória.
-municipio_filtrado = load_ibge_municipalities(bbox=tuple(gdf.total_bounds))
-joined = gpd.sjoin(gdf, municipio_filtrado, how="left", predicate="intersects")
+municipio_filtrado = load_ibge_municipalities(bbox=tuple(glebas_gdf.total_bounds))
+joined = gpd.sjoin(glebas_gdf, municipio_filtrado, how="left", predicate="intersects")
 joined["city"] = joined["NM_MUN"]
 joined["state"] = joined["NM_UF"]
 
-gleba = gdf.head(1)
+gleba = glebas_gdf
 crs_100000 = '+proj=aea +lon_0=-58.1835937 +lat_1=-36.5394082 +lat_2=-3.0767001 +lat_0=-1 9.8080541 +datum=WGS84 +units=m +no_defs'
 gleba_4326 = gleba.to_crs('EPSG:4326').iloc[0].geometry.buffer(0)
 gleba_100000 = gleba.to_crs(crs_100000).iloc[0]

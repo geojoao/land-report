@@ -40,38 +40,41 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 import contextily as ctx
-
+ 
 import matplotlib.patches as mpatches
 import matplotlib.image as mpimg
 from datetime import datetime
-
+ 
 from sqlalchemy import create_engine
-
+ 
 from pystac_client import Client
 import pystac_client
 import shapely
-
+ 
 import wtss
 from shapely.geometry import Polygon, Point
 import random
 from wcpms import *
-
+ 
 from skimage.transform import resize
-
+ 
 import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import kaleido
-
+ 
 import xml.etree.ElementTree as ET
+import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon
+ 
 import requests, zipfile, io
-
+ 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
-
+ 
 def print_status(message):
     """Prints a message to stderr to show in the console but not in the report."""
     print(message, file=sys.stderr, flush=True)
-
+ 
 def parse_operation_details_from_xml(xml_string):
     """
     Parses a COR0001 XML string to extract structured details about
@@ -79,15 +82,15 @@ def parse_operation_details_from_xml(xml_string):
     """
     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
     root = ET.fromstring(xml_string)
-    
+   
     cor_element = root.find('.//ns:COR0001', ns)
     if cor_element is None:
         return {"error": "Elemento COR0001 não encontrado no XML."}
-
+ 
     def find_text(element, path):
         node = element.find(path, ns)
         return node.text.strip() if node is not None and node.text else "N/A"
-
+ 
     general_info = {
         "Número de Controle IF": find_text(cor_element, 'ns:NumCtrlIF'),
         "CNPJ da Entidade Responsável": find_text(cor_element, 'ns:CNPJEntRespons'),
@@ -96,7 +99,7 @@ def parse_operation_details_from_xml(xml_string):
         "Valor Total da Operação": find_text(cor_element, 'ns:VlrTotOp'),
         "Data do Movimento": find_text(cor_element, 'ns:DtMovto'),
     }
-
+ 
     destinations = []
     for dest_elem in cor_element.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
         dest_info = {
@@ -108,7 +111,7 @@ def parse_operation_details_from_xml(xml_string):
             "Fim da Colheita": find_text(dest_elem, 'ns:DtFimColht'),
             "Receita Bruta Esperada": find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt'),
         }
-
+ 
         properties = []
         for prop_elem in dest_elem.findall('ns:Grupo_COR0001_Propt', ns):
             prop_details = {
@@ -117,12 +120,12 @@ def parse_operation_details_from_xml(xml_string):
                 "Número CAR": find_text(prop_elem, 'ns:NumRegCAR'),
             }
             properties.append(prop_details)
-        
+       
         dest_info["properties"] = properties
         destinations.append(dest_info)
-
+ 
     return {"general_info": general_info, "destinations": destinations}
-
+ 
 def dataframe_to_markdown(df, show_index=True):
     """
     Converts a pandas DataFrame to a markdown table string without
@@ -135,10 +138,10 @@ def dataframe_to_markdown(df, show_index=True):
         separator += " --- |"
     header += " | ".join(df.columns) + " |"
     separator += " --- |" * len(df.columns)
-    
+   
     body = "\n".join([f"| {(f'{i} | ' if show_index else '')}{' | '.join(map(str, row))} |" for i, row in df.iterrows()])
     return f"{header}\n{separator}\n{body}"
-
+ 
 def recursive_extract(elem, ns, prefix=''):
     """Recursively extract text from XML elements into a flat dict."""
     data = {}
@@ -151,22 +154,67 @@ def recursive_extract(elem, ns, prefix=''):
         else:
             data.update(recursive_extract(child, ns, key))
     return data
+ 
+# def parse_xml_to_gdf_all_fields(xml_string):
+#     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
+#     root = ET.fromstring(xml_string)
+   
+#     cor = root.find('.//ns:COR0001', ns)
+#     if cor is None:
+#         raise ValueError("No COR0001 element found in XML")
+   
+#     data = recursive_extract(cor, ns)
+   
+#     polygon_points = []
+#     destc = cor.find('ns:Grupo_COR0001_DestcFincmnt', ns)
+#     if destc is not None:
+#         gleba = destc.find('ns:Grupo_COR0001_Gleba', ns)
+#         if gleba is not None:
+#             for pt in gleba.findall('ns:Grupo_COR0001_PontoPolg', ns):
+#                 lat = pt.find('ns:LatPonto', ns)
+#                 lon = pt.find('ns:LongPonto', ns)
+#                 if lat is not None and lon is not None:
+#                     try:
+#                         lat_f = float(lat.text.strip())
+#                         lon_f = float(lon.text.strip())
+#                         polygon_points.append((lon_f, lat_f))
+#                     except Exception:
+#                         pass
+   
+#     if not polygon_points:
+#         raise ValueError("No polygon points found in XML")
+   
+#     polygon = Polygon(polygon_points)
+#     gdf = gpd.GeoDataFrame([data], geometry=[polygon], crs="EPSG:4326")
+#     return gdf
 
 def parse_xml_to_gdf_all_fields(xml_string):
     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
     root = ET.fromstring(xml_string)
-    
+   
     cor = root.find('.//ns:COR0001', ns)
     if cor is None:
         raise ValueError("No COR0001 element found in XML")
-    
+   
+    # Assuming recursive_extract extracts all fields from cor element except geometry
     data = recursive_extract(cor, ns)
-    
+   
+    data_ = {x:data[x] for x in data if 'Grupo_COR0001_DestcFincmnt' not in x}
+   
     polygon_points = []
-    destc = cor.find('ns:Grupo_COR0001_DestcFincmnt', ns)
-    if destc is not None:
-        gleba = destc.find('ns:Grupo_COR0001_Gleba', ns)
-        if gleba is not None:
+
+    # Prepare list to hold rows for GeoDataFrame
+    rows = []
+   
+    # Iterate over all Grupo_COR0001_DestcFincmnt elements (credit operations)
+    for destc in cor.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
+        # Extract data for this credit operation (you may want to extract specific fields here)
+        destc_data = recursive_extract(destc, ns)
+       
+        polygons = []
+        # Iterate over all glebas (land parcels) inside this credit operation
+        for gleba in destc.findall('ns:Grupo_COR0001_Gleba', ns):
+            polygon_points = []
             for pt in gleba.findall('ns:Grupo_COR0001_PontoPolg', ns):
                 lat = pt.find('ns:LatPonto', ns)
                 lon = pt.find('ns:LongPonto', ns)
@@ -177,35 +225,82 @@ def parse_xml_to_gdf_all_fields(xml_string):
                         polygon_points.append((lon_f, lat_f))
                     except Exception:
                         pass
-    
-    if not polygon_points:
-        raise ValueError("No polygon points found in XML")
-    
-    polygon = Polygon(polygon_points)
-    gdf = gpd.GeoDataFrame([data], geometry=[polygon], crs="EPSG:4326")
-    return gdf
+            if polygon_points:
+                # Close polygon if not closed
+                if polygon_points[0] != polygon_points[-1]:
+                    polygon_points.append(polygon_points[0])
+                polygons.append(Polygon(polygon_points))
+       
+        if not polygons:
+            # Skip if no polygons found for this credit operation
+            continue
+       
+        # Combine polygons into a MultiPolygon if more than one
+        if len(polygons) == 1:
+            geometry = polygons[0]
+        else:
+            geometry = MultiPolygon(polygons)
 
+        destc_data.update(data_)
+
+        # Combine destc_data and geometry into one dict for GeoDataFrame row
+        row = destc_data.copy()
+        row['geometry'] = geometry
+        rows.append(row)
+   
+    if not rows:
+        raise ValueError("No credit operations with land parcels found in XML")
+   
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    return gdf
+ 
+def retry_request(func, max_retries=3, delay=15, name="operação de rede", **kwargs):
+    """
+    Tenta executar uma função que faz uma requisição de rede, com retries.
+    """
+    for attempt in range(max_retries):
+        try:
+            result = func(**kwargs)
+            return result, None  # Success
+        except (requests.exceptions.RequestException, pystac_client.exceptions.APIError, Exception) as e:
+            # Filter for common network errors
+            if any(err in str(e).lower() for err in ['timeout', 'connection', 'http', 'curl', 'network']):
+                print_status(f"AVISO: Erro de rede na {name} (tentativa {attempt + 1}/{max_retries}): {e}")
+                if attempt + 1 < max_retries:
+                    print_status(f"Tentando novamente em {delay} segundos...")
+                    time.sleep(delay)
+                else:
+                    error_msg = f"Falha na {name} após {max_retries} tentativas. Último erro: {e}"
+                    print_status(f"ERRO: {error_msg}")
+                    return None, error_msg
+            else:
+                # If it's a different error, fail immediately
+                error_msg = f"Erro inesperado e não relacionado à rede na {name}: {e}"
+                print_status(f"ERRO: {error_msg}")
+                return None, error_msg
+    return None, f"Falha desconhecida na {name} após {max_retries} tentativas."
+ 
 try:
     from matplotlib_scalebar.scalebar import ScaleBar
 except ImportError:
     ScaleBar = None
-
+ 
 def load_ibge_municipalities(bbox=None):
     """
     Downloads, extracts, and loads IBGE municipalities, optionally filtered by a bounding box.
     Filtering by bbox significantly reduces memory usage.
     """
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_Municipios_2024.zip"
-    
+   
     # Construct a fsspec-compatible URI to read the shapefile directly from the zip
     # This is the most robust and memory-efficient way.
     uri = f"zip+{url}!BR_Municipios_2024.shp"
-
+ 
     gdf = gpd.read_file(uri, bbox=bbox)
     gdf = gdf.to_crs("EPSG:4326")
     return gdf
-
-
+ 
+ 
 def load_ibge_states():
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip"
     r = requests.get(url)
@@ -215,7 +310,7 @@ def load_ibge_states():
     gdf = gpd.read_file(f"ibge_states/{shp_path}")
     gdf = gdf.to_crs("EPSG:4326")
     return gdf
-
+ 
 def plot_rural_property(property_gdf, municipalities_gdf=None):
     centroid = property_gdf.geometry.centroid.iloc[0]
     lon, lat = centroid.x, centroid.y
@@ -241,14 +336,14 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
     area_ha = property_aea.geometry.area.iloc[0] / 10000
     area_m2 = property_aea.geometry.area.iloc[0]
     perimeter_m = property_aea.geometry.length.iloc[0]
-
+ 
     # Calculate additional metrics
     pa_ratio = perimeter_m / area_m2 if area_m2 > 0 else 0
     circle = property_gdf.minimum_bounding_circle().to_crs(brazil_aea_proj)
     circle_ratio = area_m2 / circle.geometry.area.iloc[0] if not circle.empty and circle.geometry.area.iloc[0] > 0 else 0
     rect = property_aea.geometry.iloc[0].minimum_rotated_rectangle
     rect_ratio = area_m2 / rect.area if rect.area > 0 else 0
-
+ 
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off")
     table_data = [
@@ -276,17 +371,17 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         ax_mini.spines['top'].set_visible(True); ax_mini.spines['right'].set_visible(True); ax_mini.spines['bottom'].set_visible(True); ax_mini.spines['left'].set_visible(True)
         ax_mini.set_axis_off()
     return fig
-
+ 
 import rioxarray
 import shapely.geometry
 import numpy as np
 import pyproj
 from shapely.ops import transform
-
+ 
 def reproject_geom(geom, src_crs, dst_crs):
     project = pyproj.Transformer.from_crs(src_crs, dst_crs, always_xy=True).transform
     return transform(project, geom)
-
+ 
 def clip_cog_raster_by_polygon(polygon, raster_cog_path):
     raster = rioxarray.open_rasterio(raster_cog_path, masked=True).squeeze(dim='band')
     raster_crs = raster.rio.crs
@@ -314,7 +409,7 @@ def clip_cog_raster_by_polygon(polygon, raster_cog_path):
     else:
         bbox_4326 = bounds_proj
     return clipped, bbox_4326
-
+ 
 def plot(imagem_cortada, bbox, classes_df, largura_figuras=10):
     fig, ax = plt.subplots(figsize=(largura_figuras, 4))
     data = imagem_cortada.values
@@ -342,7 +437,7 @@ def plot(imagem_cortada, bbox, classes_df, largura_figuras=10):
     ax.set_title('Raster Plot with Legend')
     fig.tight_layout(rect=[0, 0, 0.85, 1])
     return fig, ax
-
+ 
 def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     gs = gpd.GeoSeries([geometry_4326], crs="EPSG:4326")
     utm_crs = gs.estimate_utm_crs()
@@ -355,12 +450,12 @@ def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     points_gdf_proj = gpd.GeoDataFrame(geometry=points_proj, crs=utm_crs)
     points_gdf_4326 = points_gdf_proj.to_crs("EPSG:4326")
     return list(points_gdf_4326.geometry)
-
+ 
 import rasterio
 from rasterio.mask import mask
 from rasterio.errors import RasterioIOError
 from rasterio._err import CPLE_AppDefinedError
-
+ 
 def retry_rasterio_open(href, max_retries=5, delay=15):
     for attempt in range(max_retries):
         try:
@@ -372,7 +467,7 @@ def retry_rasterio_open(href, max_retries=5, delay=15):
                 time.sleep(delay)
             else: raise
     raise RasterioIOError(f"Failed to open {href} after {max_retries} attempts.")
-
+ 
 def carregar_banda_sentinel2_bdc(item, banda, gleba):
     asset = item.assets.get(banda)
     if asset is None: raise ValueError(f"Band {banda} not found in item assets.")
@@ -381,7 +476,7 @@ def carregar_banda_sentinel2_bdc(item, banda, gleba):
         geoms = [feature["geometry"] for feature in gleba_proj.__geo_interface__["features"]] if hasattr(gleba_proj, "__geo_interface__") else [gleba_proj.geometry]
         out_image, out_transform = mask(src, geoms, crop=True)
         return out_image[0].astype(np.float32)
-
+ 
 def carregar_banda_sentinel2_bdc_scl(item, banda, gleba, banda_scl_zoom):
     banda_array = carregar_banda_sentinel2_bdc(item, banda, gleba)
     if banda_array.shape != banda_scl_zoom.shape:
@@ -389,19 +484,19 @@ def carregar_banda_sentinel2_bdc_scl(item, banda, gleba, banda_scl_zoom):
     cloud_classes = [3, 7, 8, 9, 10, 11]
     mask_clouds = np.isin(banda_scl_zoom, cloud_classes)
     return np.where(mask_clouds, np.nan, banda_array)
-
+ 
 def normalizar(array, L):
     arr_min, arr_max = np.nanmin(array), np.nanmax(array)
     if arr_max - arr_min == 0: return np.zeros_like(array)
     return (array - arr_min) / (arr_max - arr_min) * L
-
+ 
 def aplicar_contraste_raiz(array, L, N):
     return np.power(array / L, 1/N) * L
-
+ 
 import pystac_client, rioxarray, xarray as xr, dask.diagnostics
 from odc.stac import stac_load
 import dask
-
+ 
 def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, resolution=10):
     print_status("   - Opening STAC catalog and searching for items...")
     catalog = pystac_client.Client.open(stac_url)
@@ -433,10 +528,10 @@ def process_cube(shapefile, query_bands, start_date, end_date, collections, stac
     masked_bands = {band: da.where(spatial_mask, -1) for band, da in final_cube.data_vars.items()}
     final_cube = xr.Dataset(masked_bands, coords=final_cube.coords)
     return final_cube.compute(), spatial_mask.compute()
-
+ 
 from sklearn.preprocessing import StandardScaler
 from minisom import MiniSom
-
+ 
 def som_time_series_clustering(cube, mask, n=2, random_seed=123, training_steps=100):
     cube_da = cube['NDVI']
     data = cube_da.transpose('y', 'x', 'time').values
@@ -459,7 +554,7 @@ def som_time_series_clustering(cube, mask, n=2, random_seed=123, training_steps=
     predictions[mask_flat] = predictions_valid
     predictions = predictions.reshape(mask.shape)
     return predictions, neuron_weights, predictions, som
-
+ 
 def plot_som_u_matrix(som, cmap='viridis_r'):
     from matplotlib.patheffects import withStroke
     u_matrix = som.distance_map()
@@ -477,13 +572,13 @@ def plot_som_u_matrix(som, cmap='viridis_r'):
             cluster_index = i * som_y + j
             ax.text(j, i, str(cluster_index), ha='center', va='center', color=text_colors[i, j], fontweight='bold', path_effects=path_effects)
     return fig, ax
-
+ 
 def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 6))
     else:
         fig = ax.get_figure()
-
+ 
     da = cube[band_name]
     cluster_ids = np.unique(predictions[predictions >= 0])
     for cluster_id in cluster_ids:
@@ -492,13 +587,13 @@ def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
     ax.set_xlabel('Time'); ax.set_ylabel(band_name); ax.legend()
     ax.set_title('Perfis Médios de NDVI por Cluster')
     return fig, ax
-
+ 
 def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 6))
     else:
         fig = ax.get_figure()
-
+ 
     masked_preds = np.ma.masked_equal(predictions, -1)
     valid_clusters = np.unique(masked_preds.compressed())
     if len(valid_clusters) > 0:
@@ -510,7 +605,7 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
             cmap = plt.get_cmap(cmap, n_clusters)
         bounds = np.arange(min_pred, max_pred + 2) - 0.5
         norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
-    
+   
     cmap_copy = cmap.copy()
     cmap_copy.set_bad("white")
     im = ax.imshow(masked_preds, cmap=cmap_copy, norm=norm, interpolation="none")
@@ -558,28 +653,23 @@ from tabulate import tabulate
 
 area_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
 property_aea = gdf.to_crs(area_proj)
-area_ha = property_aea[['geometry']].geometry.area.sum() / 10000
-
-codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252')
-
-empreendimento_df = codempreendimento_df[codempreendimento_df['#CODIGO']==12010560176011]
+area_ha = property_aea[['geometry']].dissolve().geometry.area.sum() / 10000
 
 dados_cadastrais_df = {
     'Instituição Financeira': 'BOCOM BBM',
     'Produtor': produtor,
     'CPF / CNPJ': gdf['Grupo_COR0001_Benfcrio_CNPJ_CPFBenfcrio'].iloc[0],
     'REFBACEN': ref_bacen,
-    'Empreendimento': '{produto} | {variedade} | {cesta}'.format(
-        produto=empreendimento_df['PRODUTO'].values[0],
-        variedade=empreendimento_df['VARIEDADE'].values[0],
-        cesta=empreendimento_df['CESTA'].values[0]
-        ),
+    #'Empreendimento': '{produto} | {variedade} | {cesta}'.format(
+    #    produto=empreendimento_df['PRODUTO'].values[0],
+    #    variedade=empreendimento_df['VARIEDADE'].values[0],
+    #    cesta=empreendimento_df['CESTA'].values[0]
+    #    ),
     'Área Financiada (ha)': area_ha,
-    'Expectativa de produtividade (Kg/ha)': (gdf['Grupo_COR0001_DestcFincmnt_QtdPrvProdc'].astype(float).sum()/1000)/area_ha,
-    'Expectativa de produção (ton)': gdf['Grupo_COR0001_DestcFincmnt_QtdPrvProdc'].astype(float).sum(),
-    'Receita esperada do empreendimento (BRL)':gdf['Grupo_COR0001_DestcFincmnt_VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum()
+    #'Expectativa de produtividade (Kg/ha)': (gdf['QtdPrvProdc'].astype(float).sum()/1000)/area_ha,
+    #'Expectativa de produção (ton)': gdf['QtdPrvProdc'].astype(float).sum(),
+    'Receita esperada do empreendimento (BRL)':gdf['VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum()
 }
-
 
 # Convert dict to list of [attribute, value]
 table_data = [[k, v] for k, v in dados_cadastrais_df.items()]
@@ -599,6 +689,14 @@ display(Markdown(markdown_table))
 ```{python}
 from tabulate import tabulate
 from IPython.display import display, Markdown
+
+codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252').rename(columns={'#CODIGO':'Código do Empreendimento'})
+
+codempreendimento_df['Código do Empreendimento'] = codempreendimento_df['Código do Empreendimento'].astype(str)
+
+
+parsed_data["destinations"] = pd.DataFrame(parsed_data["destinations"]).merge(codempreendimento_df, how='left', on='Código do Empreendimento').to_dict(orient='records')
+
 
 if "destinations" in parsed_data:
     for i, dest in enumerate(parsed_data["destinations"]):
@@ -620,38 +718,62 @@ if "destinations" in parsed_data:
 
 ```{python}
 #| echo: false
+#| results: "asis"
 
-# Constantes do script
-grid_spacing_meters = 1000
-largura_figuras = 18
-bdc_stac_link = 'https://data.inpe.br/bdc/stac/v1'
-bdc_wtss_link = 'https://data.inpe.br/bdc/wtss/v4/'
-bdc_wcpms_url = 'https://data.inpe.br/bdc/wcpms'
-colecao_s2 = 'S2-16D-2'
-colecao_cbers = 'CBERS4-WFI-16D-2'
+# --- INÍCIO DA LÓGICA REATORADA ---
 
-# Carregamento dos dados da gleba e fontes auxiliares
-try:
-    with open(f'{ref_bacen}.xml', 'r', encoding='utf-8') as f:
-        xml_content = f.read()
-    print_status("1. Lendo XML e criando GeoDataFrame...")
-    gdf = parse_xml_to_gdf_all_fields(xml_content)
-except FileNotFoundError:
-    print_status(f"ERRO: O arquivo {ref_bacen}.xml não foi encontrado.")
-    sys.exit(1)
+def processar_gleba(gleba_row, gleba_id):
+    """
+    Processa uma única gleba, gerando todas as análises e visualizações.
+    """
 
-# Carrega apenas o município que cruza com a gleba, economizando memória.
-municipio_filtrado = load_ibge_municipalities(bbox=tuple(gdf.total_bounds))
-joined = gpd.sjoin(gdf, municipio_filtrado, how="left", predicate="intersects")
-joined["city"] = joined["NM_MUN"]
-joined["state"] = joined["NM_UF"]
+    # --- Configuração da Iteração Atual ---
 
-gleba = gdf.head(1)
-crs_100000 = '+proj=aea +lon_0=-58.1835937 +lat_1=-36.5394082 +lat_2=-3.0767001 +lat_0=-1 9.8080541 +datum=WGS84 +units=m +no_defs'
-gleba_4326 = gleba.to_crs('EPSG:4326').iloc[0].geometry.buffer(0)
-gleba_100000 = gleba.to_crs(crs_100000).iloc[0]
+    # Cria uma cópia para evitar SettingWithCopyWarning
+    gleba_data = gleba_row.copy()
+    gleba_data['DtIniPlant'] = pd.to_datetime(gleba_data['DtIniPlant']) - pd.DateOffset(years=1)
+    gleba_data['DtFimColht'] = pd.to_datetime(gleba_data['DtFimColht']) - pd.DateOffset(years=1)
 
-mapbiomas_legend_csv = """Class_ID	Level	Description	Descricao	Color
+    # Converte a linha atual de volta para um GeoDataFrame
+    # É importante usar a geometria original da linha passada para a função
+    glebas_gdf = gpd.GeoDataFrame([gleba_data], geometry='geometry', crs=gdf.crs)
+
+    # Extrai as datas de início e fim dinamicamente
+    start_date = gleba_data['DtIniPlant'].strftime('%Y-%m-%d')
+    end_date = gleba_data['DtFimColht'].strftime('%Y-%m-%d')
+
+    # Gera um título principal para a seção desta gleba no relatório
+    print(f"\n---\n# Análise para a Gleba ID: {gleba_id}")
+    print(f"## Período de Análise: {gleba_data['DtIniPlant'].strftime('%d/%m/%Y')} a {gleba_data['DtFimColht'].strftime('%d/%m/%Y')}\n")
+
+    # --- Início da Lógica Original do Relatório ---
+    # (Todo o seu código de análise vai aqui, sem alterações)
+
+    # O ideal é copiar e colar todo o corpo do seu antigo 'for' aqui dentro.
+    # O código abaixo é apenas um trecho para exemplificar.
+    # Vou colar todo o seu código original aqui para ficar completo.
+
+    # Constantes do script
+    grid_spacing_meters = 1000
+    largura_figuras = 18
+    bdc_stac_link = 'https://data.inpe.br/bdc/stac/v1'
+    bdc_wtss_link = 'https://data.inpe.br/bdc/wtss/v4/'
+    bdc_wcpms_url = 'https://data.inpe.br/bdc/wcpms'
+    colecao_s2 = 'S2-16D-2'
+    colecao_cbers = 'CBERS4-WFI-16D-2'
+
+    # Carrega apenas o município que cruza com a gleba, economizando memória.
+    municipio_filtrado = load_ibge_municipalities(bbox=tuple(glebas_gdf.total_bounds))
+    joined = gpd.sjoin(glebas_gdf, municipio_filtrado, how="left", predicate="intersects")
+    joined["city"] = joined["NM_MUN"]
+    joined["state"] = joined["NM_UF"]
+
+    gleba_geo = glebas_gdf
+    crs_100000 = '+proj=aea +lon_0=-58.1835937 +lat_1=-36.5394082 +lat_2=-3.0767001 +lat_0=-1 9.8080541 +datum=WGS84 +units=m +no_defs'
+    gleba_4326 = gleba_geo.to_crs('EPSG:4326').iloc[0].geometry.buffer(0)
+    gleba_100000 = gleba_geo.to_crs(crs_100000).iloc[0]
+    
+    mapbiomas_legend_csv = """Class_ID	Level	Description	Descricao	Color
 1	1	Forest	Floresta	#32a65e
 3	2	Forest Formation	Formação Florestal	#1f8d49
 4	2	Savanna Formation	Formação Savânica	#7dc975
@@ -691,338 +813,314 @@ mapbiomas_legend_csv = """Class_ID	Level	Description	Descricao	Color
 31	2	 Aquaculture	Aquicultura	#091077
 27	1	 Not Observed	Não observado	#ffffff
 """
-classes_mapbiomas = pd.read_csv(io.StringIO(mapbiomas_legend_csv), sep='\t')
-raster_mapbiomas = "https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/collection_10/lulc/coverage/brazil_coverage_2024.tif"
-print_status("2. Fontes de dados carregadas.")
-```
+    classes_mapbiomas = pd.read_csv(io.StringIO(mapbiomas_legend_csv), sep='\t')
+    raster_mapbiomas = "https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/collection_10/lulc/coverage/brazil_coverage_2024.tif"
+    print_status(f"2. Fontes de dados carregadas para a gleba {gleba_id}.")
 
-# Localização e Métricas da Gleba
-
-A primeira etapa consiste na identificação da propriedade no território, sua localização em relação ao município e estado, e o cálculo de métricas espaciais básicas.
-
-```{python}
-#| fig-cap: "Mapa de localização da propriedade rural com informações detalhadas."
-fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
-plt.show()
-```
-
-
-# Análise de Uso e Cobertura do Solo
-
-## Cruzamento com MapBiomas
-
-A gleba foi cruzada com os dados mais recentes do MapBiomas (Coleção 10) para identificar as classes de uso e cobertura do solo predominantes na área.
-
-```{python}
-#| fig-cap: "Classificação de uso e cobertura do solo na área da gleba segundo o MapBiomas."
-print_status("3. Cruzando com o raster do MapBiomas...")
-imagem_cortada, bbox = clip_cog_raster_by_polygon(gleba_4326, raster_mapbiomas)
-fig_mapbiomas, _ = plot(imagem_cortada, bbox, classes_mapbiomas)
-fig_mapbiomas.set_size_inches(10, 6)
-plt.show()
-```
-
-# Análise de Séries Temporais
-
-Para analisar a dinâmica da vegetação ao longo do tempo, foram gerados pontos de amostragem dentro da gleba. Para cada ponto, foram extraídas as séries temporais do índice de vegetação NDVI a partir de duas fontes de dados: Sentinel-2 (10m de resolução) e CBERS-WFI (64m de resolução).
-
-## Geração de Pontos de Amostragem
-
-```{python}
-#| fig-cap: "Pontos de amostragem distribuídos em grade sobre a gleba."
-print_status(f"4. Gerando grade de pontos com espaçamento de {grid_spacing_meters}m...")
-pontos_aleatorios = generate_grid_points_by_distance(gleba_4326, grid_spacing_meters)
-total_pontos = len(pontos_aleatorios)
-print_status(f"   - Gerados {total_pontos} pontos.")
-
-# Create GeoDataFrames for easier plotting
-pontos_gdf = gpd.GeoDataFrame(geometry=pontos_aleatorios, crs="EPSG:4326")
-gleba_gdf = gpd.GeoDataFrame(geometry=[gleba_4326], crs="EPSG:4326")
-
-# Project to Web Mercator for plotting with a basemap
-pontos_proj = pontos_gdf.to_crs(epsg=3857)
-gleba_proj = gleba_gdf.to_crs(epsg=3857)
-
-# Create the plot
-fig, ax = plt.subplots(figsize=(12, 10))
-
-# Plot the property boundary
-gleba_proj.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=2.5, zorder=3)
-
-# Plot the sample points
-pontos_proj.plot(ax=ax, marker='o', color='cyan', markersize=60, edgecolor='black', zorder=4)
-
-# Add text labels with a halo for readability
-from matplotlib.patheffects import withStroke
-for idx, row in pontos_proj.iterrows():
-    ax.text(row.geometry.x + 50, row.geometry.y + 50, str(idx + 1),
-            fontsize=10, fontweight='bold', color='white',
-            path_effects=[withStroke(linewidth=2, foreground='black')], zorder=5)
-
-# Add basemap and clean up axes
-ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs=gleba_proj.crs.to_string())
-ax.set_axis_off()
-ax.set_title(f'{total_pontos} Pontos de Amostragem na Gleba', fontsize=16)
-plt.show()
-```
-
-## Séries Temporais de NDVI por Ponto
-
-```{python}
-#| fig-cap: "Séries temporais de NDVI (Sentinel-2 e CBERS-WFI) para os pontos amostrados."
-#| results: "asis"
-
-servico_wtss = wtss.WTSS(bdc_wtss_link)
-cubo_s2 = servico_wtss[colecao_s2]
-cubo_wfi = servico_wtss[colecao_cbers]
-
-print_status(f"5. Coletando séries temporais para {total_pontos} pontos...")
-import matplotlib.gridspec as gridspec
-
-for i, ponto in enumerate(pontos_aleatorios):
-    ts_s2, ts_wfi = None, None
-    max_retries, delay = 3, 15
-    for attempt in range(max_retries):
-        try:
-            print_status(f"   - Ponto {i+1}, Tentativa {attempt + 1}/{max_retries}...")
-            ts_s2 = cubo_s2.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
-            ts_wfi = cubo_wfi.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
-            break # Sucesso, sair do loop
-        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
-            print_status(f"   - AVISO: Erro de rede ao buscar série temporal para o ponto {i+1}: {e}")
-            if attempt + 1 < max_retries:
-                print_status(f"   - Tentando novamente em {delay} segundos...")
-                time.sleep(delay)
-            else:
-                print_status(f"   - ERRO: Máximo de tentativas atingido para o ponto {i+1}. Pulando este ponto.")
-
-    if not ts_s2 or not ts_wfi:
-        continue # Pula para o próximo ponto se a busca falhou
-    
-    fig = plt.figure(figsize=(12, 5))
-    gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1])
-    ax_main = plt.subplot(gs[0])
-
-    ax_main.plot(ts_s2.timeline, np.array(ts_s2.NDVI)/10000, color='tab:green', alpha=0.9, linewidth=1.5, marker='o', markersize=4, label='Sentinel-2 NDVI')
-    ax_main.plot(ts_wfi.timeline, np.array(ts_wfi.NDVI)/10000, color='tab:red', alpha=0.9, linewidth=1.5, marker='x', markersize=4, label='CBERS-WFI NDVI')
-    
-    ax_main.grid(True, linestyle='--', alpha=0.6)
-    ax_main.tick_params(axis='x', labelrotation=45)
-    ax_main.set_ylim([0.0, 1.0])
-    ax_main.set_title(f'Série Temporal NDVI - Ponto {i+1}')
-    ax_main.set_xlabel("Data"); ax_main.set_ylabel("NDVI"); ax_main.legend()
-
-    ax_map = plt.subplot(gs[1])
-    gpd.GeoSeries(gleba_4326).plot(ax=ax_map, color='lightgray', edgecolor='black')
-    gpd.GeoDataFrame(geometry=pontos_aleatorios).plot(ax=ax_map, marker='.', color='blue', markersize=30)
-    gpd.GeoDataFrame(geometry=[ponto]).plot(ax=ax_map, marker='*', color='red', markersize=150, edgecolor='white')
-    ax_map.set_title(f'Localização Ponto {i+1}'); ax_map.set_xticks([]); ax_map.set_yticks([])
-    
-    fig.tight_layout()
+    print("\n### Localização e Métricas da Gleba\n")
+    print("A primeira etapa consiste na identificação da propriedade no território, sua localização em relação ao município e estado, e o cálculo de métricas espaciais básicas.\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Mapa de localização da propriedade rural com informações detalhadas.*\n:::\n:::')
+    fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
     plt.show()
-```
 
-# Análise de Imagens de Satélite
+    print("\n### Análise de Uso e Cobertura do Solo\n")
+    print("#### Cruzamento com MapBiomas\n")
+    print("A gleba foi cruzada com os dados mais recentes do MapBiomas (Coleção 10) para identificar as classes de uso e cobertura do solo predominantes na área.\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Classificação de uso e cobertura do solo na área da gleba segundo o MapBiomas.*\n:::\n:::')
+    print_status("3. Cruzando com o raster do MapBiomas...")
+    imagem_cortada, bbox = clip_cog_raster_by_polygon(gleba_4326, raster_mapbiomas)
+    fig_mapbiomas, _ = plot(imagem_cortada, bbox, classes_mapbiomas)
+    fig_mapbiomas.set_size_inches(10, 6)
+    plt.show()
 
-Foram processadas imagens do satélite Sentinel-2 para o período de análise. Para cada data disponível, foi gerada uma composição colorida e um gráfico de estatísticas.
+    print("\n### Análise de Séries Temporais\n")
+    print("Para analisar a dinâmica da vegetação ao longo do tempo, foram gerados pontos de amostragem dentro da gleba. Para cada ponto, foram extraídas as séries temporais do índice de vegetação NDVI a partir de duas fontes de dados: Sentinel-2 (10m de resolução) e CBERS-WFI (64m de resolução).\n")
+    print("#### Geração de Pontos de Amostragem\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Pontos de amostragem distribuídos em grade sobre a gleba.*\n:::\n:::')
+    print_status(f"4. Gerando grade de pontos com espaçamento de {grid_spacing_meters}m...")
+    pontos_aleatorios = generate_grid_points_by_distance(gleba_4326, grid_spacing_meters)
+    total_pontos = len(pontos_aleatorios)
+    print_status(f"   - Gerados {total_pontos} pontos.")
+    pontos_gdf = gpd.GeoDataFrame(geometry=pontos_aleatorios, crs="EPSG:4326")
+    gleba_gdf_plot = gpd.GeoDataFrame(geometry=[gleba_4326], crs="EPSG:4326")
+    pontos_proj = pontos_gdf.to_crs(epsg=3857)
+    gleba_proj = gleba_gdf_plot.to_crs(epsg=3857)
+    fig, ax = plt.subplots(figsize=(12, 10))
+    gleba_proj.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=2.5, zorder=3)
+    pontos_proj.plot(ax=ax, marker='o', color='cyan', markersize=60, edgecolor='black', zorder=4)
+    from matplotlib.patheffects import withStroke
+    for idx, row in pontos_proj.iterrows():
+        ax.text(row.geometry.x + 50, row.geometry.y + 50, str(idx + 1),
+                fontsize=10, fontweight='bold', color='white',
+                path_effects=[withStroke(linewidth=2, foreground='black')], zorder=5)
+    ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs=gleba_proj.crs.to_string())
+    ax.set_axis_off()
+    ax.set_title(f'{total_pontos} Pontos de Amostragem na Gleba', fontsize=16)
+    plt.show()
 
-## Recortes de Imagens e Estatísticas Temporais
-
-Cada imagem é um recorte da gleba, acompanhado de um gráfico com as seguintes métricas percentuais:
-
-*   **nv**: nuvens
-*   **vg**: vegetação (NDVI > 0.7)
-*   **qm**: queimada (NBR < -0.45)
-*   **tx**: textura (desvio padrão do NDVI)
-*   **um**: umidade/água (NDWI > -0.1)
-*   **so**: solo exposto (SCI > 0.0)
-
-A composição colorida utiliza as bandas NIR (vermelho), SWIR (verde) e Red (azul) para realçar a vegetação e a umidade do solo.
-
-```{python}
-#| fig-cap: "Recortes de imagens Sentinel-2 e estatísticas de cobertura para cada data."
-print_status("6. Buscando e processando imagens Sentinel-2...")
-inpe_catalog = pystac_client.Client.open(bdc_stac_link)
-item_search = inpe_catalog.search(collections=[colecao_s2], datetime=f'{start_date}/{end_date}', bbox=gleba_4326.bounds)
-time_ordered_items = sorted(list(item_search.items()), key=lambda a: a.datetime, reverse=False)
-total_rasters = item_search.matched()
-
-delta = 1e-10
-t, set_of_items = 0, set()
-colunas = 4
-linhas_plot = math.ceil(total_rasters / colunas) if total_rasters > 0 else 1
-fig_clips_estatisticas = plt.figure(figsize=(16, 2 * linhas_plot))
-
-for item in time_ordered_items:
-    if item.properties['datetime'] in set_of_items: continue
-    set_of_items.add(item.properties['datetime'])
-    t += 1
-    title = item.properties['datetime'][:10]
-    print_status(f" - Processando imagem {t}/{total_rasters} de {title}...")
-
-    banda_scl = carregar_banda_sentinel2_bdc(item, 'SCL', gleba)
-    banda_04_ref = carregar_banda_sentinel2_bdc(item, 'B04', gleba)
-    banda_scl_zoom = resize(banda_scl, banda_04_ref.shape, order=0)
+    print("\n#### Séries Temporais de NDVI por Ponto\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Séries temporais de NDVI (Sentinel-2 e CBERS-WFI) para os pontos amostrados.*\n:::\n:::')
     
-    banda_03 = carregar_banda_sentinel2_bdc_scl(item, 'B03', gleba, banda_scl_zoom)
-    banda_04 = carregar_banda_sentinel2_bdc_scl(item, 'B04', gleba, banda_scl_zoom)
-    banda_08 = carregar_banda_sentinel2_bdc_scl(item, 'B08', gleba, banda_scl_zoom)
-    banda_11 = carregar_banda_sentinel2_bdc(item, 'B11', gleba)
-    banda_11_zoom = resize(banda_11, banda_04_ref.shape, order=0)
-
-    total_pixels = len(banda_scl_zoom[banda_scl_zoom > 0])
-    porcentagem_nuvens = 100 * len(banda_scl_zoom[banda_scl_zoom > 7]) / total_pixels
+    # --- NEW: Function to wrap the entire WTSS initialization ---
+    def initialize_and_fetch_points():
+        # Step 1: Initialize the service and cubes (this is where the error occurred)
+        servico_wtss = wtss.WTSS(bdc_wtss_link)
+        cubo_s2 = servico_wtss[colecao_s2]
+        cubo_wfi = servico_wtss[colecao_cbers]
+        print_status(f"5. Coletando séries temporais para {total_pontos} pontos...")
     
-    banda_ndvi = (banda_08 - banda_04) / (banda_08 + banda_04 + delta)
-    porcentagem_vegetacao = 100 * len(banda_ndvi[np.nan_to_num(banda_ndvi) > 0.7]) / total_pixels
+        # Step 2: Fetch time series for each point (this part was already correct)
+        import matplotlib.gridspec as gridspec
+        successful_plots = 0
+        for i, ponto in enumerate(pontos_aleatorios):
+            # This inner call still needs a simple try/except because it's inside the main one
+            try:
+                print_status(f"   - Ponto {i+1}...")
+                ts_s2 = cubo_s2.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
+                ts_wfi = cubo_wfi.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
+                
+                if not ts_s2 or not ts_wfi:
+                    print_status(f"   - AVISO: Dados de série temporal incompletos para o ponto {i+1}.")
+                    continue
+                
+                successful_plots += 1
+                fig = plt.figure(figsize=(12, 5))
+                gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1])
+                ax_main = plt.subplot(gs[0])
+                ax_main.plot(ts_s2.timeline, np.array(ts_s2.NDVI)/10000, color='tab:green', alpha=0.9, linewidth=1.5, marker='o', markersize=4, label='Sentinel-2 NDVI')
+                ax_main.plot(ts_wfi.timeline, np.array(ts_wfi.NDVI)/10000, color='tab:red', alpha=0.9, linewidth=1.5, marker='x', markersize=4, label='CBERS-WFI NDVI')
+                ax_main.grid(True, linestyle='--', alpha=0.6)
+                ax_main.tick_params(axis='x', labelrotation=45)
+                ax_main.set_ylim([0.0, 1.0])
+                ax_main.set_title(f'Série Temporal NDVI - Ponto {i+1}')
+                ax_main.set_xlabel("Data"); ax_main.set_ylabel("NDVI"); ax_main.legend()
+                ax_map = plt.subplot(gs[1])
+                gpd.GeoSeries(gleba_4326).plot(ax=ax_map, color='lightgray', edgecolor='black')
+                gpd.GeoDataFrame(geometry=pontos_aleatorios).plot(ax=ax_map, marker='.', color='blue', markersize=30)
+                gpd.GeoDataFrame(geometry=[ponto]).plot(ax=ax_map, marker='*', color='red', markersize=150, edgecolor='white')
+                ax_map.set_title(f'Localização Ponto {i+1}'); ax_map.set_xticks([]); ax_map.set_yticks([])
+                fig.tight_layout()
+                plt.show()
     
-    banda_nbr = (banda_08 - banda_11_zoom) / (banda_08 + banda_11_zoom + delta)
-    porcentagem_queimados = 100 * len(banda_nbr[np.nan_to_num(banda_nbr) < -0.45]) / total_pixels
-
-    textura = np.absolute(np.nanstd(banda_ndvi) * 100)
-
-    banda_ndwi = (banda_03 - banda_08) / (banda_03 + banda_08 + delta)
-    porcentagem_umidade = 100 * len(banda_ndwi[np.nan_to_num(banda_ndwi) > -0.1]) / total_pixels
-
-    banda_sci = (banda_11_zoom - banda_08) / (banda_11_zoom + banda_08 + delta)
-    porcentagem_solo = 100 * len(banda_sci[np.nan_to_num(banda_sci) > 0.0]) / total_pixels
+            except Exception as e:
+                print_status(f"   - AVISO: Erro ao buscar dados para o ponto {i+1}: {e}. Pulando.")
+        
+        # If after all points, none were successful, this is noted.
+        if successful_plots == 0 and total_pontos > 0:
+             print_status(f"   - AVISO FINAL: Nenhuma série temporal foi plotada com sucesso.")
     
-    matriz_rgb = np.zeros((banda_04.shape[0], banda_04.shape[1], 3))
-    L, N = 2**12, 2
-    matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08, L), L, N) / L
-    matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
-    matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04, L), L, N) / L
-
-    plt.subplot(linhas_plot, 2 * colunas, 2 * t - 1)
-    plt.imshow(np.clip(matriz_rgb, 0, 1))
-    plt.xticks([]); plt.yticks([])
     
-    plt.subplot(linhas_plot, 2 * colunas, 2 * t)
-    plt.barh([1, 2, 3, 4, 5, 6], [porcentagem_nuvens, porcentagem_vegetacao, porcentagem_queimados, textura, porcentagem_umidade, porcentagem_solo], tick_label=['nv', 'vg', 'qm', 'tx', 'um', 'so'], color=['tab:cyan', 'tab:green', 'tab:orange', 'tab:red', 'tab:blue', 'tab:brown']) 
-    plt.xlim([0, 100]); plt.box(False); plt.title(f'{title}')
+    # --- MODIFIED: Call the new wrapped function within the retry handler ---
+    _, error = retry_request(
+        func=initialize_and_fetch_points,
+        name="conexão inicial e busca de séries temporais (WTSS)"
+    )
+    
+    if error:
+        print('::: {.callout-warning}')
+        print('## Falha na Obtenção das Séries Temporais')
+        print(f'Não foi possível conectar ao serviço WTSS do INPE ou obter os dados após múltiplas tentativas. Esta seção da análise foi pulada. Erro: {error}')
+        print(':::')
 
-plt.tight_layout()
-plt.show()
-```
+    print("\n### Análise de Imagens de Satélite\n")
+    print("Foram processadas imagens do satélite Sentinel-2 para o período de análise. Para cada data disponível, foi gerada uma composição colorida e um gráfico de estatísticas.\n")
+    print("#### Recortes de Imagens e Estatísticas Temporais\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Recortes de imagens Sentinel-2 e estatísticas de cobertura para cada data.*\n:::\n:::')
+    def search_stac_items(stac_link, collection, start_date, end_date, bbox):
+        catalog = pystac_client.Client.open(stac_link)
+        search = catalog.search(collections=[collection], datetime=f'{start_date}/{end_date}', bbox=bbox)
+        return sorted(list(search.get_all_items()), key=lambda a: a.datetime, reverse=False)
 
-## Composições RGB (Sem Máscara de Nuvens)
+    print_status("6. Buscando e processando imagens Sentinel-2...")
+    time_ordered_items, error = retry_request(
+        func=search_stac_items,
+        name="busca de itens Sentinel-2 no catálogo STAC",
+        stac_link=bdc_stac_link,
+        collection=colecao_s2,
+        start_date=start_date,
+        end_date=end_date,
+        bbox=gleba_4326.bounds
+    )
 
-```{python}
-#| fig-cap: "Composições coloridas (B08, B11, B04) sem máscara de nuvens."
-print_status("7. Gerando composições RGB...")
-colunas_rgb = 4
-linhas_plot_rgb = math.ceil(total_rasters / colunas_rgb) if total_rasters > 0 else 1
-fig_rgb_clips = plt.figure(figsize=(16, 3 * linhas_plot_rgb))
+    if error:
+        print('::: {.callout-warning}')
+        print('## Falha na Busca de Imagens de Satélite')
+        print(f'Não foi possível buscar a lista de imagens de satélite do catálogo STAC do INPE. Toda a análise de imagens (recortes, RGB, EVI) foi pulada. Erro: {error}')
+        print(':::')
+        time_ordered_items = []
 
-t_rgb = 0
-for item in time_ordered_items:
-    t_rgb += 1
-    title = item.properties['datetime'][:10]
+    total_rasters = len(time_ordered_items)
+    if total_rasters > 0:
+        delta = 1e-10
+        t, set_of_items = 0, set()
+        colunas = 4
+        linhas_plot = math.ceil(total_rasters / colunas) if total_rasters > 0 else 1
+        fig_clips_estatisticas = plt.figure(figsize=(16, 2 * linhas_plot))
+        for item in time_ordered_items:
+            if item.properties['datetime'] in set_of_items: continue
+            set_of_items.add(item.properties['datetime'])
+            t += 1
+            title = item.properties['datetime'][:10]
+            print_status(f" - Processando imagem {t}/{total_rasters} de {title}...")
+            banda_scl = carregar_banda_sentinel2_bdc(item, 'SCL', gleba_geo)
+            banda_04_ref = carregar_banda_sentinel2_bdc(item, 'B04', gleba_geo)
+            banda_scl_zoom = resize(banda_scl, banda_04_ref.shape, order=0)
+            banda_03 = carregar_banda_sentinel2_bdc_scl(item, 'B03', gleba_geo, banda_scl_zoom)
+            banda_04 = carregar_banda_sentinel2_bdc_scl(item, 'B04', gleba_geo, banda_scl_zoom)
+            banda_08 = carregar_banda_sentinel2_bdc_scl(item, 'B08', gleba_geo, banda_scl_zoom)
+            banda_11 = carregar_banda_sentinel2_bdc(item, 'B11', gleba_geo)
+            banda_11_zoom = resize(banda_11, banda_04_ref.shape, order=0)
+            total_pixels = len(banda_scl_zoom[banda_scl_zoom > 0])
+            porcentagem_nuvens = 100 * len(banda_scl_zoom[banda_scl_zoom > 7]) / total_pixels
+            banda_ndvi = (banda_08 - banda_04) / (banda_08 + banda_04 + delta)
+            porcentagem_vegetacao = 100 * len(banda_ndvi[np.nan_to_num(banda_ndvi) > 0.7]) / total_pixels
+            banda_nbr = (banda_08 - banda_11_zoom) / (banda_08 + banda_11_zoom + delta)
+            porcentagem_queimados = 100 * len(banda_nbr[np.nan_to_num(banda_nbr) < -0.45]) / total_pixels
+            textura = np.absolute(np.nanstd(banda_ndvi) * 100)
+            banda_ndwi = (banda_03 - banda_08) / (banda_03 + banda_08 + delta)
+            porcentagem_umidade = 100 * len(banda_ndwi[np.nan_to_num(banda_ndwi) > -0.1]) / total_pixels
+            banda_sci = (banda_11_zoom - banda_08) / (banda_11_zoom + banda_08 + delta)
+            porcentagem_solo = 100 * len(banda_sci[np.nan_to_num(banda_sci) > 0.0]) / total_pixels
+            matriz_rgb = np.zeros((banda_04.shape[0], banda_04.shape[1], 3))
+            L, N = 2**12, 2
+            matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08, L), L, N) / L
+            matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
+            matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04, L), L, N) / L
+            plt.subplot(linhas_plot, 2 * colunas, 2 * t - 1)
+            plt.imshow(np.clip(matriz_rgb, 0, 1))
+            plt.xticks([]); plt.yticks([])
+            plt.subplot(linhas_plot, 2 * colunas, 2 * t)
+            plt.barh([1, 2, 3, 4, 5, 6], [porcentagem_nuvens, porcentagem_vegetacao, porcentagem_queimados, textura, porcentagem_umidade, porcentagem_solo], tick_label=['nv', 'vg', 'qm', 'tx', 'um', 'so'], color=['tab:cyan', 'tab:green', 'tab:orange', 'tab:red', 'tab:blue', 'tab:brown']) 
+            plt.xlim([0, 100]); plt.box(False); plt.title(f'{title}')
+        plt.tight_layout()
+        plt.show()
+
+    print("\n#### Composições RGB (Sem Máscara de Nuvens)\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Composições coloridas (B08, B11, B04) sem máscara de nuvens.*\n:::\n:::')
+    print_status("7. Gerando composições RGB...")
+    if total_rasters > 0:
+        colunas_rgb = 4
+        linhas_plot_rgb = math.ceil(total_rasters / colunas_rgb) if total_rasters > 0 else 1
+        fig_rgb_clips = plt.figure(figsize=(16, 3 * linhas_plot_rgb))
+        t_rgb = 0
+        for item in time_ordered_items:
+            t_rgb += 1
+            title = item.properties['datetime'][:10]
+            try:
+                banda_04 = carregar_banda_sentinel2_bdc(item, 'B04', gleba_geo)
+                if banda_04.size == 0: continue
+                banda_08 = carregar_banda_sentinel2_bdc(item, 'B08', gleba_geo)
+                banda_11 = carregar_banda_sentinel2_bdc(item, 'B11', gleba_geo)
+                banda_11_zoom = resize(banda_11, banda_04.shape, order=1, preserve_range=True, anti_aliasing=True)
+                L, N = 2**12, 2
+                matriz_rgb = np.zeros((banda_04.shape[0], banda_04.shape[1], 3), dtype=np.float32)
+                matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08, L), L, N) / L
+                matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
+                matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04, L), L, N) / L
+                ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
+                ax.imshow(np.clip(matriz_rgb, 0, 1)); ax.set_title(title); ax.set_xticks([]); ax.set_yticks([])
+            except Exception as e:
+                ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
+                ax.set_title(f"{title}\n(Erro)"); ax.set_xticks([]); ax.set_yticks([])
+        plt.tight_layout()
+        plt.show()
+
+    print("\n#### Índice de Vegetação Realçado (EVI)\n")
+    print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Mapas de EVI (Enhanced Vegetation Index) para cada data.*\n:::\n:::')
+    print_status("8. Calculando EVI...")
+    if total_rasters > 0:
+        G, C1, C2, L_evi, SCALE_FACTOR = 2.5, 6.0, 7.5, 1.0, 10000.0
+        colunas_evi = 4
+        linhas_plot_evi = math.ceil(total_rasters / colunas_evi) if total_rasters > 0 else 1
+        fig_evi_clips = plt.figure(figsize=(16, 3 * linhas_plot_evi))
+        t_evi = 0
+        for item in time_ordered_items:
+            t_evi += 1
+            try:
+                banda_scl = carregar_banda_sentinel2_bdc(item, 'SCL', gleba_geo)
+                banda_04_ref = carregar_banda_sentinel2_bdc(item, 'B04', gleba_geo)
+                if banda_04_ref.size == 0: continue
+                banda_scl_zoom = resize(banda_scl, banda_04_ref.shape, order=0, preserve_range=True, anti_aliasing=False)
+                banda_02 = carregar_banda_sentinel2_bdc_scl(item, 'B02', gleba_geo, banda_scl_zoom)
+                banda_04 = carregar_banda_sentinel2_bdc_scl(item, 'B04', gleba_geo, banda_scl_zoom)
+                banda_08 = carregar_banda_sentinel2_bdc_scl(item, 'B08', gleba_geo, banda_scl_zoom)
+                refl_02, refl_04, refl_08 = [b.astype(np.float32) / SCALE_FACTOR for b in [banda_02, banda_04, banda_08]]
+                numerator = G * (refl_08 - refl_04)
+                denominator = (refl_08 + C1 * refl_04 - C2 * refl_02 + L_evi)
+                banda_evi = np.divide(numerator, denominator, where=denominator!=0)
+                ax = plt.subplot(linhas_plot_evi, colunas_evi, t_evi)
+                im = ax.imshow(banda_evi, cmap='viridis', vmin=0, vmax=1)
+                ax.set_title(item.properties['datetime'][:10]); ax.set_xticks([]); ax.set_yticks([])
+            except Exception as e:
+                ax = plt.subplot(linhas_plot_evi, colunas_evi, t_evi)
+                ax.set_title(f"{item.properties['datetime'][:10]}\n(Error)"); ax.set_xticks([]); ax.set_yticks([])
+        fig_evi_clips.subplots_adjust(right=0.9)
+        cbar_ax = fig_evi_clips.add_axes([0.92, 0.15, 0.02, 0.7])
+        fig_evi_clips.colorbar(im, cax=cbar_ax, label='EVI')
+        plt.tight_layout(rect=[0, 0, 0.9, 1])
+        plt.show()
+
+    print("\n### Agrupamento de Padrões Temporais (SOM)\n")
+    print("Utilizando a técnica de Mapas Auto-Organizáveis (SOM), as séries temporais de NDVI de cada pixel da gleba foram agrupadas em n x n clusters. Isso permite identificar áreas com comportamento fenológico similar ao longo do tempo (por exemplo, áreas de cultivo, pastagem, vegetação nativa).\n")
+    print_status("9. Criando cubo de dados para clusterização SOM...")
+
+    cubo, mask, error = None, None, None
     try:
-        banda_04 = carregar_banda_sentinel2_bdc(item, 'B04', gleba)
-        if banda_04.size == 0: continue
-        banda_08 = carregar_banda_sentinel2_bdc(item, 'B08', gleba)
-        banda_11 = carregar_banda_sentinel2_bdc(item, 'B11', gleba)
-        banda_11_zoom = resize(banda_11, banda_04.shape, order=1, preserve_range=True, anti_aliasing=True)
-        L, N = 2**12, 2
-        matriz_rgb = np.zeros((banda_04.shape[0], banda_04.shape[1], 3), dtype=np.float32)
-        matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08, L), L, N) / L
-        matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
-        matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04, L), L, N) / L
-        ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
-        ax.imshow(np.clip(matriz_rgb, 0, 1)); ax.set_title(title); ax.set_xticks([]); ax.set_yticks([])
+        if total_rasters > 0: # Only try if we found images in the previous step
+            cubo, mask = process_cube(shapefile=gleba_geo, query_bands=['NDVI', 'SCL'], start_date=start_date, end_date=end_date, collections=[colecao_s2], stac_url=bdc_stac_link, resolution=10)
+        else:
+            # Don't set an error, just acknowledge there's nothing to process
+            print_status("   - AVISO: Nenhuma imagem encontrada no passo anterior. Análise SOM pulada.")
     except Exception as e:
-        ax = plt.subplot(linhas_plot_rgb, colunas_rgb, t_rgb)
-        ax.set_title(f"{title}\n(Erro)"); ax.set_xticks([]); ax.set_yticks([])
+        error = e
+        print_status(f"ERRO: Falha ao processar o cubo de dados para SOM: {e}")
 
-plt.tight_layout()
-plt.show()
-```
+    if error or cubo is None:
+        # Only print error message if there was an actual error
+        if error:
+            print('::: {.callout-warning}')
+            print('## Falha na Análise de Clusterização (SOM)')
+            print(f'Não foi possível gerar o cubo de dados do serviço do INPE necessário para a análise SOM. Esta seção foi pulada. Erro: {error}')
+            print(':::')
+    elif 'time' in cubo.dims and len(cubo.time) > 1:
+        sqrt_n = 3
+        print_status("10. Executando clusterização SOM...")
+        result, neuron_weights, predictions, som = som_time_series_clustering(cubo, mask, n=sqrt_n, random_seed=123, training_steps=100)
+        num_clusters = sqrt_n * sqrt_n
+        base_cmap = plt.get_cmap('tab20', num_clusters)
+        color_list = [base_cmap(i) for i in range(num_clusters)]
+        cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
+        
+        print("\n#### Análise dos Clusters SOM\n")
+        print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Análise combinada dos clusters SOM, mostrando os perfis temporais de NDVI (esquerda) e sua distribuição espacial na gleba (direita).*\n:::\n:::')
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [2, 1]})
+        plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1)
+        plot_cluster_image(predictions, cmap, ax=ax2, show_colorbar=False)
+        fig.suptitle('Análise de Clusters SOM', fontsize=16)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.show()
 
-## Índice de Vegetação Realçado (EVI)
+        print("\n#### Matriz-U (Fronteiras dos Clusters)\n")
+        print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Matriz-U do SOM, mostrando a separabilidade entre os clusters.*\n:::\n:::')
+        fig_som_u_matrix, _ = plot_som_u_matrix(som)
+        plt.title('Matriz-U do SOM (Fronteiras entre Clusters)')
+        plt.show()
+    else:
+        print_status("   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.")
 
-```{python}
-#| fig-cap: "Mapas de EVI (Enhanced Vegetation Index) para cada data."
-print_status("8. Calculando EVI...")
-G, C1, C2, L_evi, SCALE_FACTOR = 2.5, 6.0, 7.5, 1.0, 10000.0
-colunas_evi = 4
-linhas_plot_evi = math.ceil(total_rasters / colunas_evi) if total_rasters > 0 else 1
-fig_evi_clips = plt.figure(figsize=(16, 3 * linhas_plot_evi))
 
-t_evi = 0
-for item in time_ordered_items:
-    t_evi += 1
-    try:
-        banda_scl = carregar_banda_sentinel2_bdc(item, 'SCL', gleba)
-        banda_04_ref = carregar_banda_sentinel2_bdc(item, 'B04', gleba)
-        if banda_04_ref.size == 0: continue
-        banda_scl_zoom = resize(banda_scl, banda_04_ref.shape, order=0, preserve_range=True, anti_aliasing=False)
-        banda_02 = carregar_banda_sentinel2_bdc_scl(item, 'B02', gleba, banda_scl_zoom)
-        banda_04 = carregar_banda_sentinel2_bdc_scl(item, 'B04', gleba, banda_scl_zoom)
-        banda_08 = carregar_banda_sentinel2_bdc_scl(item, 'B08', gleba, banda_scl_zoom)
-        refl_02, refl_04, refl_08 = [b.astype(np.float32) / SCALE_FACTOR for b in [banda_02, banda_04, banda_08]]
-        numerator = G * (refl_08 - refl_04)
-        denominator = (refl_08 + C1 * refl_04 - C2 * refl_02 + L_evi)
-        banda_evi = np.divide(numerator, denominator, where=denominator!=0)
-        ax = plt.subplot(linhas_plot_evi, colunas_evi, t_evi)
-        im = ax.imshow(banda_evi, cmap='viridis', vmin=0, vmax=1)
-        ax.set_title(item.properties['datetime'][:10]); ax.set_xticks([]); ax.set_yticks([])
-    except Exception as e:
-        ax = plt.subplot(linhas_plot_evi, colunas_evi, t_evi)
-        ax.set_title(f"{item.properties['datetime'][:10]}\n(Error)"); ax.set_xticks([]); ax.set_yticks([])
+# --- Bloco Principal do Relatório ---
 
-fig_evi_clips.subplots_adjust(right=0.9)
-cbar_ax = fig_evi_clips.add_axes([0.92, 0.15, 0.02, 0.7])
-fig_evi_clips.colorbar(im, cax=cbar_ax, label='EVI')
-plt.tight_layout(rect=[0, 0, 0.9, 1])
-plt.show()
-```
+# Explode o GeoDataFrame para garantir que cada polígono individual seja processado.
+# exploded_gdf = gdf.explode(index_parts=True).iloc[[0]] # Remova o .iloc[[0]] para rodar para todas
+exploded_gdf = gdf.explode(index_parts=True)
 
-# Agrupamento de Padrões Temporais (SOM)
+# Itera sobre cada gleba e chama a função de processamento
+for index, gleba_row in exploded_gdf.iterrows():
+    # O índice pode ser um tuple (se index_parts=True), então pegamos o ID original
+    gleba_id = index[0] if isinstance(index, tuple) else index
 
-Utilizando a técnica de Mapas Auto-Organizáveis (SOM), as séries temporais de NDVI de cada pixel da gleba foram agrupadas em `n x n` clusters. Isso permite identificar áreas com comportamento fenológico similar ao longo do tempo (por exemplo, áreas de cultivo, pastagem, vegetação nativa).
+    # Chama a função principal, que cuida de tudo
+    processar_gleba(gleba_row, gleba_id)
 
-```{python}
-#| echo: false
-print_status("9. Criando cubo de dados para clusterização SOM...")
-cubo, mask = process_cube(shapefile=gleba, query_bands=['NDVI', 'SCL'], start_date=start_date, end_date=end_date, collections=[colecao_s2], stac_url=bdc_stac_link, resolution=10)
-
-sqrt_n = 3
-print_status("10. Executando clusterização SOM...")
-result, neuron_weights, predictions, som = som_time_series_clustering(cubo, mask, n=sqrt_n, random_seed=123, training_steps=100)
-
-num_clusters = sqrt_n * sqrt_n
-base_cmap = plt.get_cmap('tab20', num_clusters)
-color_list = [base_cmap(i) for i in range(num_clusters)]
-cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
-```
-
-## Análise dos Clusters SOM
-
-```{python}
-#| fig-cap: "Análise combinada dos clusters SOM, mostrando os perfis temporais de NDVI (esquerda) e sua distribuição espacial na gleba (direita)."
-#| fig-width: 12
-#| fig-height: 5
-
-# Create a figure with two subplots
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [2, 1]})
-
-# Plot the temporal profiles on the first subplot
-plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1)
-
-# Plot the spatial cluster map on the second subplot, without a colorbar
-plot_cluster_image(predictions, cmap, ax=ax2, show_colorbar=False)
-
-fig.suptitle('Análise de Clusters SOM', fontsize=16)
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-```
-
-## Matriz-U (Fronteiras dos Clusters)
-
-```{python}
-#| fig-cap: "Matriz-U do SOM, mostrando a separabilidade entre os clusters."
-fig_som_u_matrix, _ = plot_som_u_matrix(som)
-plt.title('Matriz-U do SOM (Fronteiras entre Clusters)')
-plt.show()
 ```
