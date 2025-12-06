@@ -12,8 +12,6 @@ jupyter: sicor-bacen
 params:
   produtor: "Straglioto"
   ref_bacen: "513438999"
-  start_date: '2022-01-01'
-  end_date: '2022-12-31'
 ---
 
 
@@ -23,8 +21,6 @@ params:
 
 produtor = "Straglioto"
 ref_bacen = "513438999"
-start_date = '2022-01-01'
-end_date = '2022-12-31'
 ```
 
 ```{python}
@@ -44,6 +40,8 @@ import contextily as ctx
 import matplotlib.patches as mpatches
 import matplotlib.image as mpimg
 from datetime import datetime
+from dateutil.relativedelta import relativedelta
+
  
 from sqlalchemy import create_engine
  
@@ -55,10 +53,10 @@ import wtss
 from shapely.geometry import Polygon, Point
 import random
 from wcpms import *
+from scipy.signal import savgol_filter
  
 from skimage.transform import resize
  
-import datetime
 from matplotlib.backends.backend_pdf import PdfPages
 import kaleido
  
@@ -67,64 +65,26 @@ import geopandas as gpd
 from shapely.geometry import Polygon, MultiPolygon
  
 import requests, zipfile, io
- 
+
+from sklearn.preprocessing import StandardScaler
+from minisom import MiniSom
+
+import pystac_client, rioxarray, xarray as xr, dask.diagnostics
+from odc.stac import stac_load
+import dask
+from rasterio.warp import reproject, Resampling
+from shapely.geometry import mapping
+from rasterio.io import MemoryFile
+from rasterio.merge import merge
+
+from collections import defaultdict
+
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
  
 def print_status(message):
     """Prints a message to stderr to show in the console but not in the report."""
     print(message, file=sys.stderr, flush=True)
- 
-def parse_operation_details_from_xml(xml_string):
-    """
-    Parses a COR0001 XML string to extract structured details about
-    financing destinations and associated properties (matricules).
-    """
-    ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
-    root = ET.fromstring(xml_string)
-   
-    cor_element = root.find('.//ns:COR0001', ns)
-    if cor_element is None:
-        return {"error": "Elemento COR0001 não encontrado no XML."}
- 
-    def find_text(element, path):
-        node = element.find(path, ns)
-        return node.text.strip() if node is not None and node.text else "N/A"
- 
-    general_info = {
-        "Número de Controle IF": find_text(cor_element, 'ns:NumCtrlIF'),
-        "CNPJ da Entidade Responsável": find_text(cor_element, 'ns:CNPJEntRespons'),
-        "Data de Emissão": find_text(cor_element, 'ns:DtEms'),
-        "Data de Vencimento": find_text(cor_element, 'ns:DtVenc'),
-        "Valor Total da Operação": find_text(cor_element, 'ns:VlrTotOp'),
-        "Data do Movimento": find_text(cor_element, 'ns:DtMovto'),
-    }
- 
-    destinations = []
-    for dest_elem in cor_element.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
-        dest_info = {
-            "Código do Empreendimento": find_text(dest_elem, 'ns:CodEmpnmnt'),
-            "Valor da Parcela de Crédito": find_text(dest_elem, 'ns:VlrParclCred'),
-            "Início do Plantio": find_text(dest_elem, 'ns:DtIniPlant'),
-            "Fim do Plantio": find_text(dest_elem, 'ns:DtFimPlant'),
-            "Início da Colheita": find_text(dest_elem, 'ns:DtIniColht'),
-            "Fim da Colheita": find_text(dest_elem, 'ns:DtFimColht'),
-            "Receita Bruta Esperada": find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt'),
-        }
- 
-        properties = []
-        for prop_elem in dest_elem.findall('ns:Grupo_COR0001_Propt', ns):
-            prop_details = {
-                "NIRF": find_text(prop_elem, 'ns:NIRF'),
-                "Código SNCR": find_text(prop_elem, 'ns:CodSNCR'),
-                "Número CAR": find_text(prop_elem, 'ns:NumRegCAR'),
-            }
-            properties.append(prop_details)
-       
-        dest_info["properties"] = properties
-        destinations.append(dest_info)
- 
-    return {"general_info": general_info, "destinations": destinations}
  
 def dataframe_to_markdown(df, show_index=True):
     """
@@ -142,86 +102,255 @@ def dataframe_to_markdown(df, show_index=True):
     body = "\n".join([f"| {(f'{i} | ' if show_index else '')}{' | '.join(map(str, row))} |" for i, row in df.iterrows()])
     return f"{header}\n{separator}\n{body}"
  
-def recursive_extract(elem, ns, prefix=''):
-    """Recursively extract text from XML elements into a flat dict."""
-    data = {}
-    for child in elem:
-        tag = child.tag.split('}', 1)[-1]
-        key = f"{prefix}_{tag}" if prefix else tag
-        if len(child) == 0:
-            text = child.text.strip() if child.text else None
-            data[key] = text
-        else:
-            data.update(recursive_extract(child, ns, key))
-    return data
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from IPython.display import display, Markdown
+import json
+
+def plot_df_as_table(df, title="", col_widths=None, is_kv_style=False, fig_height_scale=0.5, font_size=10, zebra_stripe=True, bold_first_col=False):
+    """
+    Gera uma imagem de tabela estilizada a partir de um DataFrame usando matplotlib.
+    """
+    plot_df = df.copy()
+    cell_text = plot_df.values.tolist()
+    col_labels = plot_df.columns.tolist()
+    num_cols = len(col_labels)
+
+    num_rows = len(cell_text)
+    fig_height = max(1, num_rows * fig_height_scale)
+    
+    fig, ax = plt.subplots(figsize=(8, fig_height))
+    ax.axis('off')
+    if title:
+        ax.set_title(title, fontweight="bold", loc='left', pad=10)
+
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        cellLoc='left',
+        loc='center',
+        colWidths=col_widths
+    )
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(font_size)
+    table.scale(1, 1.8)
+
+    # Estiliza o cabeçalho
+    for (i, j), cell in table.get_celld().items():
+        if i == 0:
+            cell.get_text().set_weight('bold')
+            cell.set_facecolor('#e0e0e0')
+        cell.set_edgecolor('#dddddd')
+
+    # Estilo de linhas zebradas
+    if zebra_stripe:
+        for i in range(num_rows):
+            bg_color = '#f9f9f9' if i % 2 == 0 else '#ffffff'
+            for j in range(num_cols):
+                table[(i + 1, j)].set_facecolor(bg_color)
+
+    # Estilo chave-valor (primeira coluna em negrito)
+    if is_kv_style or bold_first_col:
+        for i in range(num_rows):
+            table[(i + 1, 0)].get_text().set_weight('bold')
+            # O estilo is_kv_style original só coloria as duas primeiras colunas
+            if is_kv_style and not zebra_stripe:
+                bg_color = '#f9f9f9' if i % 2 == 0 else '#ffffff'
+                table[(i + 1, 0)].set_facecolor(bg_color)
+                table[(i + 1, 1)].set_facecolor(bg_color)
+
+    plt.tight_layout()
+    plt.show()
+
+import xml.etree.ElementTree as ET
+import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon
+import json
+
+def _find_text(element, path, ns, default="N/A"):
+    """
+    Helper function to find text in an XML element.
+    Returns 'default' (N/A) if not found.
+    """
+    if element is None:
+        return default
+    node = element.find(path, ns)
+    return node.text.strip() if node is not None and node.text else default
 
 def parse_xml_to_gdf_all_fields(xml_string):
+    """
+    Parses a COR0001 XML string to extract all general, destination, 
+    property, and geometry data into a single GeoDataFrame.
+    
+    Each row represents one 'Grupo_COR0001_DestcFincmnt' (financing destination).
+    Nested repeating groups (Beneficiaries, Properties, Parcels, ZARC) 
+    are stored as JSON strings.
+    """
     ns = {'ns': 'http://www.bcb.gov.br/MES/COR0001.xsd'}
     root = ET.fromstring(xml_string)
-   
-    cor = root.find('.//ns:COR0001', ns)
-    if cor is None:
-        raise ValueError("No COR0001 element found in XML")
-   
-    # Assuming recursive_extract extracts all fields from cor element except geometry
-    data = recursive_extract(cor, ns)
-   
-    data_ = {x:data[x] for x in data if 'Grupo_COR0001_DestcFincmnt' not in x}
-   
-    polygon_points = []
+    
+    # 1. Find key elements
+    bcmsg_element = root.find('.//ns:BCMSG', ns)
+    cor_element = root.find('.//ns:COR0001', ns)
+    
+    if cor_element is None:
+        raise ValueError("Elemento COR0001 não encontrado no XML.")
 
-    # Prepare list to hold rows for GeoDataFrame
+    # 2. Extract General (Surface) Info - This will be repeated for all rows
+    general_info = {
+        # BCMSG Fields
+        "IdentdEmissor": _find_text(bcmsg_element, 'ns:IdentdEmissor', ns),
+        "IdentdDestinatario": _find_text(bcmsg_element, 'ns:IdentdDestinatario', ns),
+        "DomSist": _find_text(bcmsg_element, 'ns:DomSist', ns),
+        "NUOp": _find_text(bcmsg_element, 'ns:NUOp', ns),
+        
+        # COR0001 Top-Level Fields
+        "CodMsg": _find_text(cor_element, 'ns:CodMsg', ns),
+        "NumCtrlIF": _find_text(cor_element, 'ns:NumCtrlIF', ns),
+        "CNPJEntRespons": _find_text(cor_element, 'ns:CNPJEntRespons', ns),
+        "DtEms": _find_text(cor_element, 'ns:DtEms', ns),
+        "DtVenc": _find_text(cor_element, 'ns:DtVenc', ns),
+        "NumCedlCredRuralIF": _find_text(cor_element, 'ns:NumCedlCredRuralIF', ns),
+        "TpInstntoCred": _find_text(cor_element, 'ns:TpInstntoCred', ns),
+        "VlrTotOp": _find_text(cor_element, 'ns:VlrTotOp', ns),
+        "CodPorteBenfcrio": _find_text(cor_element, 'ns:CodPorteBenfcrio', ns),
+        "DtMovto": _find_text(cor_element, 'ns:DtMovto', ns),
+    }
+
+    # 3. Extract Operation-Wide Lists (e.g., Beneficiaries) as JSON
+    beneficiaries = []
+    for benf_elem in cor_element.findall('ns:Grupo_COR0001_Benfcrio', ns):
+        benf_data = {
+            "TpPessoaBenfcrio": _find_text(benf_elem, 'ns:TpPessoaBenfcrio', ns),
+            "CNPJ_CPFBenfcrio": _find_text(benf_elem, 'ns:CNPJ_CPFBenfcrio', ns),
+            "TpBenfcrioCOR": _find_text(benf_elem, 'ns:TpBenfcrioCOR', ns),
+        }
+        beneficiaries.append(benf_data)
+    general_info['Beneficiarios'] = json.dumps(beneficiaries)
+
+    # 4. Prepare list to hold rows for GeoDataFrame
     rows = []
-   
-    # Iterate over all Grupo_COR0001_DestcFincmnt elements (credit operations)
-    for destc in cor.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
-        # Extract data for this credit operation (you may want to extract specific fields here)
-        destc_data = recursive_extract(destc, ns)
-       
+    
+    # 5. Iterate over all Destinations (the "deep level" data)
+    for dest_elem in cor_element.findall('ns:Grupo_COR0001_DestcFincmnt', ns):
+        # Start a new row with the general (surface) info
+        row = general_info.copy()
+
+        # 6. Extract specific Destination Info (Single Fields)
+        dest_info = {
+            "CodProg_LinhaCred": _find_text(dest_elem, 'ns:CodProg_LinhaCred', ns),
+            "TpFnteRec": _find_text(dest_elem, 'ns:TpFnteRec', ns),
+            "CodEmpnmnt": _find_text(dest_elem, 'ns:CodEmpnmnt', ns),
+            "CodSistProdc": _find_text(dest_elem, 'ns:CodSistProdc', ns),
+            "VlrParclCred": _find_text(dest_elem, 'ns:VlrParclCred', ns),
+            "VlrParclRecProprio": _find_text(dest_elem, 'ns:VlrParclRecProprio', ns),
+            "PercJurosEncargoFinanc": _find_text(dest_elem, 'ns:PercJurosEncargoFinanc', ns),
+            "TpEncargoFinancCompltar": _find_text(dest_elem, 'ns:TpEncargoFinancCompltar', ns),
+            "QtdPrvProdc": _find_text(dest_elem, 'ns:QtdPrvProdc', ns),
+            "CodModSegr": _find_text(dest_elem, 'ns:CodModSegr', ns),
+            "VlrReceitaBrutEsprdEmpnmnt": _find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt', ns),
+            "DtIniPlant": _find_text(dest_elem, 'ns:DtIniPlant', ns),
+            "DtFimPlant": _find_text(dest_elem, 'ns:DtFimPlant', ns),
+            "DtIniColht": _find_text(dest_elem, 'ns:DtIniColht', ns),
+            "DtFimColht": _find_text(dest_elem, 'ns:DtFimColht', ns),
+        }
+        row.update(dest_info)
+
+        # 7. Extract Destination-Specific Lists (as JSON)
+        
+        # Properties
+        properties = []
+        for prop_elem in dest_elem.findall('ns:Grupo_COR0001_Propt', ns):
+            prop_details = {
+                "TpPessoaPropt": _find_text(prop_elem, 'ns:TpPessoaPropt', ns),
+                "CNPJBase_CPFPropt": _find_text(prop_elem, 'ns:CNPJBase_CPFPropt', ns),
+                "NIRF": _find_text(prop_elem, 'ns:NIRF', ns),
+                "CodSNCR": _find_text(prop_elem, 'ns:CodSNCR', ns),
+                "NumRegCAR": _find_text(prop_elem, 'ns:NumRegCAR', ns),
+            }
+            properties.append(prop_details)
+        row['Properties'] = json.dumps(properties) if properties else "[]"
+        
+        # Parcels (Payment Installments)
+        parcels = []
+        for parcl_elem in dest_elem.findall('ns:Grupo_COR0001_Parcl', ns):
+            parcl_details = {
+                "NumParcl": _find_text(parcl_elem, 'ns:NumParcl', ns),
+                "DtPrvPgto": _find_text(parcl_elem, 'ns:DtPrvPgto', ns),
+                "VlrPrincipalParcl": _find_text(parcl_elem, 'ns:VlrPrincipalParcl', ns),
+            }
+            parcels.append(parcl_details)
+        row['Parcels'] = json.dumps(parcels) if parcels else "[]"
+
+        # ZARC
+        zarc_list = []
+        for zarc_elem in dest_elem.findall('ns:Grupo_COR0001_ZARC', ns):
+            zarc_details = {
+                "CodCicloCultr": _find_text(zarc_elem, 'ns:CodCicloCultr', ns),
+                "TpSolo": _find_text(zarc_elem, 'ns:TpSolo', ns),
+                "TpManj": _find_text(zarc_elem, 'ns:TpManj', ns),
+            }
+            zarc_list.append(zarc_details)
+        row['ZARC'] = json.dumps(zarc_list) if zarc_list else "[]"
+
+        # 8. Extract associated Geometries (Glebas)
         polygons = []
-        # Iterate over all glebas (land parcels) inside this credit operation
-        for gleba in destc.findall('ns:Grupo_COR0001_Gleba', ns):
+        for gleba in dest_elem.findall('ns:Grupo_COR0001_Gleba', ns):
             polygon_points = []
+            # We can also extract IdentcGleba if needed, 
+            # but it's not added to the row for now.
+            # identc_gleba = _find_text(gleba, 'ns:IdentcGleba', ns)
+            
             for pt in gleba.findall('ns:Grupo_COR0001_PontoPolg', ns):
-                lat = pt.find('ns:LatPonto', ns)
-                lon = pt.find('ns:LongPonto', ns)
-                if lat is not None and lon is not None:
+                lat_node = pt.find('ns:LatPonto', ns)
+                lon_node = pt.find('ns:LongPonto', ns)
+                if lat_node is not None and lon_node is not None:
                     try:
-                        lat_f = float(lat.text.strip())
-                        lon_f = float(lon.text.strip())
+                        lat_f = float(lat_node.text.strip())
+                        lon_f = float(lon_node.text.strip())
                         polygon_points.append((lon_f, lat_f))
-                    except Exception:
-                        pass
-            if polygon_points:
+                    except (ValueError, TypeError):
+                        pass # Skip invalid points
+            
+            if len(polygon_points) > 2: # Need at least 3 points for a polygon
                 # Close polygon if not closed
                 if polygon_points[0] != polygon_points[-1]:
                     polygon_points.append(polygon_points[0])
                 polygons.append(Polygon(polygon_points))
-       
+        
+        # If no valid polygons were found for this destination, skip it
         if not polygons:
-            # Skip if no polygons found for this credit operation
             continue
-       
+            
         # Combine polygons into a MultiPolygon if more than one
         if len(polygons) == 1:
-            geometry = polygons[0]
+            row['geometry'] = polygons[0]
         else:
-            geometry = MultiPolygon(polygons)
-
-        destc_data.update(data_)
-
-        # Combine destc_data and geometry into one dict for GeoDataFrame row
-        row = destc_data.copy()
-        row['geometry'] = geometry
+            row['geometry'] = MultiPolygon(polygons)
+        
+        # Add the completed row
         rows.append(row)
-   
+    
+    # 9. Create final GeoDataFrame
     if not rows:
-        raise ValueError("No credit operations with land parcels found in XML")
-   
+        # Return an empty GeoDataFrame with expected columns if no data found
+        columns = list(general_info.keys())
+        columns.extend([
+            "CodProg_LinhaCred", "TpFnteRec", "CodEmpnmnt", "CodSistProdc", 
+            "VlrParclCred", "VlrParclRecProprio", "PercJurosEncargoFinanc", 
+            "TpEncargoFinancCompltar", "QtdPrvProdc", "CodModSegr", 
+            "VlrReceitaBrutEsprdEmpnmnt", "DtIniPlant", "DtFimPlant", 
+            "DtIniColht", "DtFimColht", "Properties", "Parcels", "ZARC", 
+            "geometry"
+        ])
+        return gpd.GeoDataFrame([], columns=columns, crs="EPSG:4326")
+    
     gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
     return gdf
  
-def retry_request(func, max_retries=3, delay=15, name="operação de rede", **kwargs):
+def retry_request(func, max_retries=8, delay=5, name="operação de rede", **kwargs):
     """
     Tenta executar uma função que faz uma requisição de rede, com retries.
     """
@@ -246,7 +375,7 @@ def retry_request(func, max_retries=3, delay=15, name="operação de rede", **kw
                 print_status(f"ERRO: {error_msg}")
                 return None, error_msg
     return None, f"Falha desconhecida na {name} após {max_retries} tentativas."
- 
+
 try:
     from matplotlib_scalebar.scalebar import ScaleBar
 except ImportError:
@@ -338,7 +467,221 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         ax_mini.spines['top'].set_visible(True); ax_mini.spines['right'].set_visible(True); ax_mini.spines['bottom'].set_visible(True); ax_mini.spines['left'].set_visible(True)
         ax_mini.set_axis_off()
     return fig
- 
+
+# --- Certifique-se de que todas as importações estão no topo ---
+import matplotlib.pyplot as plt
+import contextily as ctx
+from matplotlib_scalebar.scalebar import ScaleBar
+from pyproj import Transformer
+from matplotlib.ticker import FuncFormatter
+import geopandas as gpd
+import matplotlib.patches as patches
+
+def plot_rural_property(property_gdf, municipalities_gdf=None):
+    """
+    Plota um mapa detalhado de uma propriedade rural com mapa principal,
+    minimapa de localização e uma tabela de informações estilizada.
+    """
+    
+    # Extrai informações básicas de geometria
+    centroid = property_gdf.geometry.centroid.iloc[0]
+    lon, lat = centroid.x, centroid.y
+    
+    # Configuração inicial da Figura
+    fig = plt.figure(figsize=(12, 8))
+    
+    # --- 1. Eixo Principal (Main Map) ---
+    ax_main = fig.add_axes([0.05, 0.1, 0.65, 0.85])
+
+    # Reprojeta a propriedade para Mercator (EPSG:3857) para o basemap
+    property_proj = property_gdf.to_crs(epsg=3857)
+    
+    # Calcula os limites do mapa com um buffer
+    minx, miny, maxx, maxy = property_proj.total_bounds
+    center_x, center_y = (minx + maxx) / 2, (miny + maxy) / 2
+    max_dim = max(maxx - minx, maxy - miny)
+    buffer = max_dim * 0.2
+    new_half_side = (max_dim / 2) + buffer
+    ax_main.set_xlim(center_x - new_half_side, center_x + new_half_side)
+    ax_main.set_ylim(center_y - new_half_side, center_y + new_half_side)
+
+    # --- 2. Formatadores de Ticks (Converte Mercator para Lat/Lon) ---
+    transformer_to_latlon = Transformer.from_crs("epsg:3857", "epsg:4326")
+    
+    # Pega os limites exatos do eixo (em Mercator)
+    x_min_ax, x_max_ax = ax_main.get_xlim()
+    y_min_ax, y_max_ax = ax_main.get_ylim()
+
+    # Função para formatar o eixo X (Longitude)
+    def format_lon(x, pos):
+        # Usa o 'y' da base do mapa (y_min_ax) como referência
+        lat, lon = transformer_to_latlon.transform(x, y_min_ax)
+        return f"{lon:.4f}°"
+
+    # Função para formatar o eixo Y (Latitude)
+    def format_lat(y, pos):
+        # Usa o 'x' da esquerda do mapa (x_min_ax) como referência
+        lat, lon = transformer_to_latlon.transform(x_min_ax, y)
+        return f"{lat:.4f}°"
+
+    # Aplica os formatadores
+    ax_main.xaxis.set_major_formatter(FuncFormatter(format_lon))
+    ax_main.yaxis.set_major_formatter(FuncFormatter(format_lat))
+
+    # --- 3. Adiciona Basemap e Geometrias ao Mapa Principal ---
+    
+    # Adiciona o mapa base de satélite
+    ctx.add_basemap(ax_main, source=ctx.providers.Esri.WorldImagery, crs='epsg:3857', attribution="")
+    
+    # Plota a geometria da propriedade
+    property_proj.plot(ax=ax_main, facecolor="none", edgecolor="red", linewidth=2)
+
+    # --- 4. Estilização da Moldura e Ticks do Mapa Principal ---
+    
+    # Cria a moldura grossa
+    frame_width = 2.0
+    for spine in ax_main.spines.values():
+        spine.set_visible(True)
+        spine.set_linewidth(frame_width)
+
+    # Estiliza os ticks (rótulos de lat/lon)
+    ax_main.tick_params(axis='both', which='major', labelsize=9, direction='in', length=6, width=1, pad=5)
+    plt.setp(ax_main.get_xticklabels(), rotation=30, ha='right') # Rotaciona labels X
+
+    # --- 5. Adiciona Barra de Escala ---
+    if ScaleBar is not None:
+        scalebar = ScaleBar(1, # 1 metro no sistema de projeção (Mercator)
+                            location='lower right', 
+                            box_alpha=0, 
+                            border_pad=0.5, 
+                            color='white', 
+                            frameon=False, 
+                            font_properties={'size': 9})
+        ax_main.add_artist(scalebar)
+    
+    # --- 6. Cálculos de Geometria para a Tabela ---
+    # Projeção Albers Equal Area para cálculos corretos de área/distância no Brasil
+    brazil_aea_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+    property_aea = property_gdf.to_crs(brazil_aea_proj)
+    
+    area_m2 = property_aea.geometry.area.iloc[0]
+    area_ha = area_m2 / 10000
+    perimeter_m = property_aea.geometry.length.iloc[0]
+    
+    # Métricas de Compacidade
+    pa_ratio = perimeter_m / area_m2 if area_m2 > 0 else 0
+    circle = property_gdf.minimum_bounding_circle().to_crs(brazil_aea_proj)
+    circle_ratio = area_m2 / circle.geometry.area.iloc[0] if not circle.empty and circle.geometry.area.iloc[0] > 0 else 0
+    rect = property_aea.geometry.iloc[0].minimum_rotated_rectangle
+    rect_ratio = area_m2 / rect.area if rect.area > 0 else 0
+
+    # --- 7. Tabela de Informações Estilizada ---
+    ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
+    ax_info.axis("off") # Desliga o eixo do container da tabela
+    
+    # Prepara os dados da tabela
+    table_data = [
+        ["City", f"{property_gdf['city'].iloc[0]}"],
+        ["State", f"{property_gdf['state'].iloc[0]}"],
+        ["Centroid", f"{lat:.4f}, {lon:.4f}"],
+        ["Área", f"{area_ha:.2f} ha"],
+        ["Perímetro", f"{perimeter_m:.2f} m"],
+        ["Razão P/A", f"{pa_ratio:.4f}"],
+        ["Compacidade (Círculo)", f"{circle_ratio:.4f}"],
+        ["Compacidade (Retângulo)", f"{rect_ratio:.4f}"]
+    ]
+    col_labels = ["Attribute", "Value"]
+    num_rows = len(table_data)
+    num_cols = len(col_labels)
+
+    # Cria a tabela
+    table = ax_info.table(
+        cellText=table_data, 
+        colLabels=col_labels, 
+        loc='center', 
+        cellLoc='left', 
+        colWidths=[0.3, 0.7] # Largura das colunas
+    )
+    
+    # Ajusta tamanho da fonte e altura das linhas
+    table.auto_set_font_size(False)
+    table.set_fontsize(9) # Fonte menor
+    table.scale(1, 1.8) # Aumenta a altura da linha
+
+    # Aplica o estilo (zebrado, negrito, etc.)
+    for (i, j), cell in table.get_celld().items():
+        if i == 0: # Linha do Cabeçalho
+            cell.get_text().set_weight('bold')
+            cell.set_facecolor('#e0e0e0')
+        cell.set_edgecolor('#dddddd') # Borda da célula
+
+    # Linhas de dados (zebradas e com chave em negrito)
+    for i in range(num_rows):
+        bg_color = '#f9f9f9' if i % 2 == 0 else '#ffffff' # Cor da linha (zebrada)
+        for j in range(num_cols):
+            table[(i + 1, j)].set_facecolor(bg_color)
+        
+        # Define a primeira coluna (chave) em negrito
+        table[(i + 1, 0)].get_text().set_weight('bold')
+    
+    
+    # --- 8. Minimapa de Localização ---
+    if municipalities_gdf is not None and not municipalities_gdf.empty:
+        
+        # Carrega dados do estado e município
+        states_gdf = load_ibge_states() 
+        state_name = property_gdf['state'].iloc[0]
+        city_name = property_gdf['city'].iloc[0]
+        state_geom = states_gdf[states_gdf['NM_UF'] == state_name]
+        
+        # Tenta extrair a sigla do estado
+        state_uf = "" # Valor padrão
+        if not state_geom.empty:
+            try:
+                # Tenta 'SIGLA_UF' primeiro, depois 'abbrev_state' (comum no geobr)
+                if 'SIGLA_UF' in state_geom.columns:
+                    state_uf = state_geom['SIGLA_UF'].iloc[0]
+                elif 'abbrev_state' in state_geom.columns:
+                    state_uf = state_geom['abbrev_state'].iloc[0]
+            except (KeyError, IndexError):
+                pass # Mantém state_uf como ""
+
+        # Cria o eixo do minimapa
+        #ax_mini = fig.add_axes([0.72, 0.65, 0.25, 0.25])
+        ax_mini = fig.add_axes([0.71, 0.62, 0.28, 0.28])
+        
+        # Plota as geometrias
+        state_geom.plot(ax=ax_mini, facecolor="#d3d3d3", edgecolor="black")
+        municipalities_gdf.plot(ax=ax_mini, facecolor="#808080", edgecolor="black")
+        property_gdf.centroid.plot(ax=ax_mini, color='red', markersize=20)
+        
+        # Adiciona o título
+        mini_title = f"{city_name} - {state_uf}"
+        ax_mini.set_title(mini_title, fontsize=10, pad=3)
+
+        # Habilita a moldura (spines) e desliga os rótulos (ticks)
+        for spine in ax_mini.spines.values():
+            spine.set_visible(True)
+            spine.set_linewidth(1.0)
+        
+        ax_mini.set_xticks([])
+        ax_mini.set_yticks([])
+        
+    # --- 9. Adiciona a Moldura Externa à Figura Inteira ---
+    fig.patches.extend([
+        patches.Rectangle(
+            (0.01, 0.01), 0.98, 0.98, # (x,y), width, height
+            transform=fig.transFigure,
+            fill=False,
+            edgecolor='black',
+            linewidth=2.5
+        )
+    ])
+        
+    return fig
+
+#plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
+
 import rioxarray
 import shapely.geometry
 import numpy as np
@@ -435,6 +778,114 @@ def retry_rasterio_open(href, max_retries=5, delay=15):
             else: raise
     raise RasterioIOError(f"Failed to open {href} after {max_retries} attempts.")
  
+
+def _open_asset(item, banda):
+    """Return a rasterio DatasetReader for the given asset if present, else None."""
+    asset = item.assets.get(banda)
+    if asset is None:
+        return None
+    return retry_rasterio_open(asset.href)
+
+
+def merge_band_for_date(items_on_date, banda, gleba):
+    """Merge the given band across all items in items_on_date using rasterio.merge.
+
+    Optimization: for each item, read only the masked crop (rasterio.mask.mask) using the
+    gleba geometry transformed to the dataset CRS. Then mosaic the small crops in-memory.
+
+    Returns: merged_array (2D float32) or None, out_transform, out_crs
+    """
+    sources = []  # temporary list of (array, transform)
+    out_crs = None
+    for item in items_on_date:
+        ds = _open_asset(item, banda)
+        if ds is None:
+            continue
+        try:
+            # project gleba to dataset CRS and mask
+            try:
+                gleba_proj = gleba.to_crs(ds.crs)
+            except Exception:
+                # if gleba has no CRS info or conversion fails, assume it's already in ds.crs
+                gleba_proj = gleba
+
+            # extract single geometry mapping for mask
+            if isinstance(gleba_proj, gpd.GeoDataFrame):
+                geom = mapping(gleba_proj.iloc[0].geometry)
+            else:
+                # assume shapely geometry
+                geom = mapping(gleba_proj.geometry if hasattr(gleba_proj, 'geometry') else gleba_proj)
+
+            out_image, out_transform = mask(ds, [geom], crop=True)
+            if out_image is None or out_image.size == 0:
+                continue
+
+            # store array + transform for in-memory merge
+            sources.append((out_image[0].astype(np.float32), out_transform))
+            if out_crs is None:
+                out_crs = ds.crs
+        except Exception as e:
+            print_status(f"Warning: failed to read/mask asset {banda} from item {getattr(item, 'id', '')}: {e}")
+        finally:
+            try:
+                ds.close()
+            except Exception:
+                pass
+
+    if len(sources) == 0:
+        return None, None, None
+
+    # rasterio.merge expects dataset-like objects with .profile/.crs; create MemoryFile datasets
+    memfiles = []
+    datasets = []
+    try:
+        for arr, tr in sources:
+            profile = {
+                'driver': 'GTiff',
+                'height': int(arr.shape[0]),
+                'width': int(arr.shape[1]),
+                'count': 1,
+                'dtype': arr.dtype,
+                'transform': tr,
+                'crs': out_crs,
+            }
+            mf = MemoryFile()
+            dst = mf.open(**profile)
+            dst.write(arr, 1)
+            dst.close()
+            # reopen for reading by merge
+            ds_read = mf.open()
+            memfiles.append(mf)
+            datasets.append(ds_read)
+
+        merged, out_transform = merge(datasets)
+        merged_arr = merged[0].astype(np.float32)
+        return merged_arr, out_transform, out_crs
+    finally:
+        for ds in datasets:
+            try:
+                ds.close()
+            except Exception:
+                pass
+        # keep memfiles out of scope to allow GC later; they will be closed when objects are collected
+
+
+def reproject_to_target(src_arr, src_transform, src_crs, dst_shape, dst_transform, dst_crs, resampling=Resampling.bilinear):
+    """Reprojects/resamples a 2D numpy array to the given destination transform/shape/crs."""
+    dst = np.full(dst_shape, np.nan, dtype=np.float32)
+    reproject(
+        source=src_arr,
+        destination=dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=resampling,
+        num_threads=2,
+    )
+    return dst
+
+ 
 def carregar_banda_sentinel2_bdc(item, banda, gleba):
     asset = item.assets.get(banda)
     if asset is None: raise ValueError(f"Band {banda} not found in item assets.")
@@ -452,18 +903,341 @@ def carregar_banda_sentinel2_bdc_scl(item, banda, gleba, banda_scl_zoom):
     mask_clouds = np.isin(banda_scl_zoom, cloud_classes)
     return np.where(mask_clouds, np.nan, banda_array)
  
+def apply_scl_mask(scl_arr, target_shape, scl_transform, scl_crs, ref_transform, ref_crs, ref_shape):
+    """Resample SCL to reference and create boolean cloud mask (True=cloud)"""
+    scl_resampled = reproject_to_target(scl_arr, scl_transform, scl_crs, ref_shape, ref_transform, ref_crs, resampling=Resampling.nearest)
+    cloud_classes = [3, 7, 8, 9, 10, 11]
+    mask_clouds = np.isin(scl_resampled, cloud_classes)
+    return mask_clouds
+
+def aplicar_contraste_raiz(array, L, N):
+    return np.power(array / L, 1/N) * L
+
 def normalizar(array, L):
     arr_min, arr_max = np.nanmin(array), np.nanmax(array)
     if arr_max - arr_min == 0: return np.zeros_like(array)
     return (array - arr_min) / (arr_max - arr_min) * L
- 
-def aplicar_contraste_raiz(array, L, N):
-    return np.power(array / L, 1/N) * L
- 
-import pystac_client, rioxarray, xarray as xr, dask.diagnostics
-from odc.stac import stac_load
-import dask
- 
+
+def merge_assets_by_date(time_ordered_items, gleba_geo):
+    G, C1, C2, L_evi, SCALE_FACTOR = 2.5, 6.0, 7.5, 1.0, 10000.0
+    grouped_items = defaultdict(list)
+    for item in time_ordered_items:
+        date = item.properties['datetime'][:10]
+        grouped_items[date].append(item)
+
+    merged_assets = {}
+    for date, items_on_date in grouped_items.items():
+        # Merge bands across items for this date
+        b02, t02, crs02 = merge_band_for_date(items_on_date, 'B02', gleba_geo)
+        b04, t04, crs04 = merge_band_for_date(items_on_date, 'B04', gleba_geo)
+        b08, t08, crs08 = merge_band_for_date(items_on_date, 'B08', gleba_geo)
+        b11, t11, crs11 = merge_band_for_date(items_on_date, 'B11', gleba_geo)
+        scl, tscl, crsscl = merge_band_for_date(items_on_date, 'SCL', gleba_geo)
+
+        # Need B02, B04 and B08 for EVI calculation
+        if b02 is None or b04 is None or b08 is None:
+            print_status(f"Skipping date {date}: missing one of B02/B04/B08 after merge")
+            continue
+
+        # Use B02 as reference grid (usually 10m)
+        ref_arr = b02
+        ref_transform = t02
+        ref_crs = crs02
+        ref_shape = ref_arr.shape
+
+        # Reproject other bands to reference grid if needed
+        if t04 is None:
+            print_status(f"B04 missing for date {date}")
+            continue
+        if not (np.allclose(t04.to_gdal(), ref_transform.to_gdal()) if hasattr(t04, 'to_gdal') else True):
+            b04 = reproject_to_target(b04, t04, crs04, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)
+
+        if t08 is None:
+            print_status(f"B08 missing for date {date}")
+            continue
+        if not (np.allclose(t08.to_gdal(), ref_transform.to_gdal()) if hasattr(t08, 'to_gdal') else True):
+            b08 = reproject_to_target(b08, t08, crs08, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)
+
+        if b11 is not None and t11 is not None:
+            b11 = reproject_to_target(b11, t11, crs11, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)
+
+        # Resample SCL and get cloud mask
+        cloud_mask = None
+        if scl is not None and tscl is not None:
+            cloud_mask = apply_scl_mask(scl, scl.shape, tscl, crsscl, ref_transform, ref_crs, ref_shape)
+
+        # Mask outside gleba geometry
+        try:
+            gleba_proj = gleba_geo.to_crs(ref_crs).iloc[0]
+            inside_mask = ~geometry_mask([mapping(gleba_proj)], transform=ref_transform, out_shape=ref_shape)
+        except Exception:
+            inside_mask = np.ones(ref_shape, dtype=bool)
+
+        # Apply inside/inside-mask and cloud mask
+        def mask_to_nan(arr):
+            if arr is None:
+                return None
+            arr = arr.astype(np.float32)
+            arr[~inside_mask] = np.nan
+            if cloud_mask is not None:
+                arr[cloud_mask] = np.nan
+            return arr
+
+        b02_m = mask_to_nan(b02)
+        b04_m = mask_to_nan(b04)
+        b08_m = mask_to_nan(b08)
+        b11_m = mask_to_nan(b11) if b11 is not None else None
+
+        # Build RGB matrix (channels: R=NIR(B08), G=B11 (resampled), B=B04)
+        L, N = 2**12, 2
+        matriz_rgb = np.zeros((ref_shape[0], ref_shape[1], 3), dtype=np.float32)
+        matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(b08_m, L), L, N) / L if b08_m is not None else np.zeros(ref_shape, dtype=np.float32)
+        if b11_m is not None:
+            matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(b11_m, L), L, N) / L
+        else:
+            matriz_rgb[:, :, 1] = np.zeros(ref_shape, dtype=np.float32)
+        matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(b04_m, L), L, N) / L if b04_m is not None else np.zeros(ref_shape, dtype=np.float32)
+
+        # Compute EVI
+        refl_02 = b02_m.astype(np.float32) / SCALE_FACTOR
+        refl_04 = b04_m.astype(np.float32) / SCALE_FACTOR
+        refl_08 = b08_m.astype(np.float32) / SCALE_FACTOR
+        numerator = G * (refl_08 - refl_04)
+        denominator = (refl_08 + C1 * refl_04 - C2 * refl_02 + L_evi)
+        banda_evi = np.divide(numerator, denominator, where=(denominator != 0))
+
+        merged_assets[date] = {'rgb': matriz_rgb, 'evi': banda_evi}
+    return merged_assets
+
+
+def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id):
+    """
+    Busca e plota a série temporal média de 6 anos para a gleba inteira
+    usando a função summarize (geom=) do WTSS.
+    
+    Args:
+        gleba_4326 (shapely.geometry): A geometria da gleba em EPSG:4326.
+        gleba_id (str): O ID da gleba para o título.
+    """
+
+    print_status("   - Definindo período de 6 anos para série temporal média (WTSS)...")
+    end_date_dt = datetime.now()
+    start_date_dt = end_date_dt - relativedelta(years=10)
+    start_date_str = start_date_dt.strftime('%Y-%m-%d')
+    end_date_str = end_date_dt.strftime('%Y-%m-%d')
+    
+    print_status(f"   - Buscando série temporal sumarizada de {start_date_str} a {end_date_str}...")
+    
+    # 1. Chamar coverage.ts com a geometria (EPSG:4326)
+    # Adicionado: Verificação para geometria vazia e conversão para GeoJSON para robustez.
+    if gleba_4326.is_empty:
+        print_status("   - AVISO: A geometria da gleba está vazia. Não é possível buscar a série temporal.")
+        return None
+
+    # Simplifica a geometria para evitar URLs muito longas que causam erro 400 (Bad Request)
+    # e a converte para um dicionário GeoJSON para garantir compatibilidade.
+    #gleba_simplificada = gleba_4326.simplify(tolerance=0.0001, preserve_topology=True)
+    gleba_geojson = gleba_4326.__geo_interface__
+    timeseries = cubo.ts(
+        attributes=('NDVI',), # Fetch SCL for cloud masking
+        geom=gleba_geojson,
+        start_date=start_date_str,
+        end_date=end_date_str,
+    )
+    
+    # 2. Chamar summarize
+    print_status("   - Sumarizando dados...")
+    summarize = timeseries.summarize()
+    
+    # 3. Plotar (usando o estilo do exemplo fornecido)
+    print_status("   - Plotando gráfico da média...")
+    
+    # Define uma paleta de cores mais corporativa
+    corporate_blue = '#003366'
+    fill_color = '#e6f0f7'
+    grid_color = '#cccccc'
+    
+    fig, ax = plt.subplots(figsize=(15, 6))
+    
+    # Extrai o DataFrame com todos os pixels usando o método .df()
+    df = summarize.df()
+
+    # --- This is the conversion snippet ---
+
+    # 2. Create the new combined column name
+    # This joins 'NDVI' and 'min' to create 'NDVI_min', etc.
+    df['band_agg'] = df['attribute'] + '_' + df['aggregation']
+
+    # 3. Pivot the DataFrame
+    # - index='datetime': makes datetime the unique rows
+    # - columns='band_agg': makes the new combined names the columns
+    # - values='value': fills the grid with the corresponding values
+    wide_df = df.pivot(index='datetime', columns='band_agg', values='value')
+
+    # 4. Clean up the DataFrame (optional but recommended)
+    # 'pivot' makes 'datetime' the index. reset_index() turns it back into a column.
+    wide_df = wide_df.reset_index()
+    # Remove the index name ('band_agg') from the top of the column index
+    wide_df.columns.name = None
+
+    # --- End of conversion snippet ---
+
+    # Calcula a média de todos os pixels para cada data (linha) e cria o DataFrame final
+    df_ts = wide_df
+
+    # --- Smoothing Step ---
+    # Aplica o filtro Savitzky-Golay para suavizar a série temporal
+    # Itera sobre todas as colunas, exceto 'datetime', e aplica o filtro
+    for col in df_ts.columns:
+        if col != 'datetime' and pd.api.types.is_numeric_dtype(df_ts[col]):
+            # O filtro requer que o window_length seja ímpar e menor que o número de pontos
+            if len(df_ts[col]) > 9:
+                df_ts[col] = savgol_filter(df_ts[col], window_length=9, polyorder=2)
+
+    # Verifica se há dados para plotar
+    if not df_ts.empty:
+        # Extrai os dados de data (índice) e valor (coluna 'NDVI_mean')
+        x_data = df_ts.datetime
+        y_data = df_ts['NDVI_mean']
+        
+        # Plota a linha principal (agora suavizada) com Matplotlib
+        ax.plot(x_data, y_data, color=corporate_blue, linewidth=2.0)
+        
+        # Preenche a área sob a curva para um visual mais rico
+        ax.fill_between(x_data, y_data, color=fill_color, alpha=0.7)
+    
+    # Ajustes de estilo para um visual mais limpo e profissional
+    ax.set_title(f'Série Temporal Média de NDVI (Últimos 6 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Data', fontsize=10)
+    ax.set_ylabel('NDVI Médio', fontsize=10)
+    ax.set_ylim(0.0, 1.0) # Forçar a escala de NDVI
+    ax.grid(axis='y', linestyle='-', alpha=0.5, color=grid_color)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    return fig
+
+def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None, harvesting_period=None):
+    """
+    Busca e plota a série temporal média de 6 anos para a gleba inteira
+    usando a função summarize (geom=) do WTSS.
+    
+    Args:
+        gleba_4326 (shapely.geometry): A geometria da gleba em EPSG:4326.
+        gleba_id (str): O ID da gleba para o título.
+        planting_period (tuple, optional): Tupla com (start_date, end_date) do plantio.
+        harvesting_period (tuple, optional): Tupla com (start_date, end_date) da colheita.
+    """
+
+    print_status("   - Definindo período de 6 anos para série temporal média (WTSS)...")
+    end_date_dt = datetime.now()
+    start_date_dt = end_date_dt - relativedelta(years=6)
+    start_date_str = start_date_dt.strftime('%Y-%m-%d')
+    end_date_str = end_date_dt.strftime('%Y-%m-%d')
+    
+    print_status(f"   - Buscando série temporal sumarizada de {start_date_str} a {end_date_str}...")
+
+    # Simplifica a geometria para evitar URLs muito longas que causam erro 400 (Bad Request)
+    # e a converte para um dicionário GeoJSON para garantir compatibilidade.
+    #gleba_simplificada = gleba_4326.simplify(tolerance=0.0001, preserve_topology=True)
+    gleba_geojson = gleba_4326.__geo_interface__
+    timeseries = cubo.ts(
+        attributes=('NDVI',), # Fetch SCL for cloud masking
+        geom=gleba_geojson,
+        start_date=start_date_str,
+        end_date=end_date_str,
+    )
+    
+    # 2. Chamar summarize
+    print_status("   - Sumarizando dados...")
+    summarize = timeseries.summarize()
+    
+    # 3. Plotar (usando o estilo do exemplo fornecido)
+    print_status("   - Plotando gráfico da média...")
+    
+    # Define uma paleta de cores mais corporativa
+    corporate_blue = '#003366'
+    fill_color = '#e6f0f7'
+    grid_color = '#cccccc'
+    
+    fig, ax = plt.subplots(figsize=(15, 6))
+    
+    # Extrai o DataFrame com todos os pixels usando o método .df()
+    df = summarize.df()
+
+    # --- This is the conversion snippet ---
+
+    # 2. Create the new combined column name
+    # This joins 'NDVI' and 'min' to create 'NDVI_min', etc.
+    df['band_agg'] = df['attribute'] + '_' + df['aggregation']
+
+    # 3. Pivot the DataFrame
+    # - index='datetime': makes datetime the unique rows
+    # - columns='band_agg': makes the new combined names the columns
+    # - values='value': fills the grid with the corresponding values
+    wide_df = df.pivot(index='datetime', columns='band_agg', values='value')
+
+    # 4. Clean up the DataFrame (optional but recommended)
+    # 'pivot' makes 'datetime' the index. reset_index() turns it back into a column.
+    wide_df = wide_df.reset_index()
+    # Remove the index name ('band_agg') from the top of the column index
+    wide_df.columns.name = None
+
+    # --- End of conversion snippet ---
+
+    # Calcula a média de todos os pixels para cada data (linha) e cria o DataFrame final
+    df_ts = wide_df
+
+    # --- Smoothing Step ---
+    # Aplica o filtro Savitzky-Golay para suavizar a série temporal
+    # Itera sobre todas as colunas, exceto 'datetime', e aplica o filtro
+    for col in df_ts.columns:
+        if col != 'datetime' and pd.api.types.is_numeric_dtype(df_ts[col]):
+            # O filtro requer que o window_length seja ímpar e menor que o número de pontos
+            if len(df_ts[col]) > 9:
+                df_ts[col] = savgol_filter(df_ts[col], window_length=9, polyorder=2)
+
+    # Verifica se há dados para plotar
+    if not df_ts.empty:
+        # Extrai os dados de data (índice) e valor (coluna 'NDVI_mean')
+        x_data = df_ts.datetime
+        y_data = df_ts['NDVI_mean']
+        
+        # Plota a linha principal (agora suavizada) com Matplotlib
+        ax.plot(x_data, y_data, color=corporate_blue, linewidth=2.0)
+        
+        # Preenche a área sob a curva para um visual mais rico
+        ax.fill_between(x_data, y_data, color=fill_color, alpha=0.7)
+
+    # --- Adiciona as janelas de plantio e colheita ---
+    if planting_period:
+        try:
+            plant_start, plant_end = pd.to_datetime(planting_period[0]), pd.to_datetime(planting_period[1])
+            ax.axvspan(plant_start, plant_end, color='green', alpha=0.2, label='Janela de Plantio Esperada')
+        except (TypeError, IndexError, ValueError) as e:
+            print_status(f"   - AVISO: Formato inválido para planting_period. Esperado (start, end). Erro: {e}")
+
+    if harvesting_period:
+        try:
+            harvest_start, harvest_end = pd.to_datetime(harvesting_period[0]), pd.to_datetime(harvesting_period[1])
+            ax.axvspan(harvest_start, harvest_end, color='orange', alpha=0.2, label='Janela de Colheita Esperada')
+        except (TypeError, IndexError, ValueError) as e:
+            print_status(f"   - AVISO: Formato inválido para harvesting_period. Esperado (start, end). Erro: {e}")
+
+    # Ajustes de estilo para um visual mais limpo e profissional
+    ax.set_title(f'Série Temporal Média de NDVI (Últimos 6 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Data', fontsize=10)
+    ax.set_ylabel('NDVI Médio', fontsize=10)
+    ax.set_ylim(0.0, 1.0) # Forçar a escala de NDVI
+    # Adiciona a legenda para incluir as janelas de plantio/colheita, se existirem
+    if planting_period or harvesting_period:
+        ax.legend(loc='upper left')
+    ax.grid(axis='y', linestyle='-', alpha=0.5, color=grid_color)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    
+    return fig
+
 def process_cube(shapefile, query_bands, start_date, end_date, collections, stac_url, resolution=10):
     print_status("   - Opening STAC catalog and searching for items...")
     catalog = pystac_client.Client.open(stac_url)
@@ -495,9 +1269,6 @@ def process_cube(shapefile, query_bands, start_date, end_date, collections, stac
     masked_bands = {band: da.where(spatial_mask, -1) for band, da in final_cube.data_vars.items()}
     final_cube = xr.Dataset(masked_bands, coords=final_cube.coords)
     return final_cube.compute(), spatial_mask.compute()
- 
-from sklearn.preprocessing import StandardScaler
-from minisom import MiniSom
  
 def som_time_series_clustering(cube, mask, n=2, random_seed=123, training_steps=100):
     cube_da = cube['NDVI']
@@ -582,114 +1353,14 @@ def plot_cluster_image(predictions, cmap, ax=None, show_colorbar=True):
         plt.colorbar(im, ax=ax, ticks=np.arange(min_pred, max_pred + 1))
     return fig, ax
 
-```
-
-
-```{python}
-#| results: "asis"
-#| tbl-cap-location: top
-#| #| echo: false
-
-# Carregamento do XML e criação do GeoDataFrame
-# Este bloco carrega e processa os dados do XML, mas não produz output visível.
-# As variáveis `gdf` e `parsed_data` ficam disponíveis para os blocos seguintes.
-try:
-    with open(f'{ref_bacen}.xml', 'r', encoding='utf-8') as f:
-        xml_content = f.read()
-except FileNotFoundError:
-    print_status(f"ERRO: O arquivo {ref_bacen}.xml não foi encontrado.")
-    sys.exit(1)
-    xml_content = None
-
-if xml_content:
-    gdf = parse_xml_to_gdf_all_fields(xml_content)
-    parsed_data = parse_operation_details_from_xml(xml_content)
-else:
-    gdf = None
-    parsed_data = {}
-```
-
-## Dados Cadastrais
-
-```{python}
-#| tbl-cap: "Resumo Geral da Operação de Crédito"
-
-from IPython.display import display, Markdown
-from tabulate import tabulate
-
-
-area_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
-property_aea = gdf.to_crs(area_proj)
-area_ha = property_aea[['geometry']].dissolve().geometry.area.sum() / 10000
-
-dados_cadastrais_df = {
-    'Instituição Financeira': 'BOCOM BBM',
-    'Produtor': produtor,
-    'CPF / CNPJ': gdf['Grupo_COR0001_Benfcrio_CNPJ_CPFBenfcrio'].iloc[0],
-    'REFBACEN': ref_bacen,
-    #'Empreendimento': '{produto} | {variedade} | {cesta}'.format(
-    #    produto=empreendimento_df['PRODUTO'].values[0],
-    #    variedade=empreendimento_df['VARIEDADE'].values[0],
-    #    cesta=empreendimento_df['CESTA'].values[0]
-    #    ),
-    'Área Financiada (ha)': area_ha,
-    #'Expectativa de produtividade (Kg/ha)': (gdf['QtdPrvProdc'].astype(float).sum()/1000)/area_ha,
-    #'Expectativa de produção (ton)': gdf['QtdPrvProdc'].astype(float).sum(),
-    'Receita esperada do empreendimento (BRL)':gdf['VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum()
-}
-
-# Convert dict to list of [attribute, value]
-table_data = [[k, v] for k, v in dados_cadastrais_df.items()]
-
-# Create Markdown table
-markdown_table = tabulate(
-    table_data,
-    headers=["Campo", "Informação"],
-    tablefmt="pipe"
-)
-display(Markdown(markdown_table))
-```
-
-
-## Detalhes por Empreendimento
-
-```{python}
-from tabulate import tabulate
-from IPython.display import display, Markdown
-
-codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252').rename(columns={'#CODIGO':'Código do Empreendimento'})
-
-codempreendimento_df['Código do Empreendimento'] = codempreendimento_df['Código do Empreendimento'].astype(str)
-
-
-parsed_data["destinations"] = pd.DataFrame(parsed_data["destinations"]).merge(codempreendimento_df, how='left', on='Código do Empreendimento').to_dict(orient='records')
-
-
-if "destinations" in parsed_data:
-    for i, dest in enumerate(parsed_data["destinations"]):
-        display(Markdown(f"Empreendimento {i+1} (Código: {dest['Código do Empreendimento']})"))
-        
-        # Detalhes do empreendimento
-        dest_details = [[k, v] for k, v in dest.items() if k != "properties"]
-        markdown_table_dest = tabulate(dest_details, headers=["Atributo", "Valor"], tablefmt="pipe")
-        display(Markdown(f'{markdown_table_dest}\n\n: Detalhes do Empreendimento {i+1}'))
-        
-        # Matrículas associadas
-        if dest["properties"]:
-            display(Markdown("Imóveis Associados"))
-            matr_data = [list(d.values()) for d in dest["properties"]]
-            headers = list(dest["properties"][0].keys())
-            markdown_table_matr = tabulate(matr_data, headers=headers, tablefmt="pipe")
-            display(Markdown(f'{markdown_table_matr}\n\n: Imóveis Associados ao Empreendimento {i+1}'))
-```
-
-```{python}
-#| echo: false
-#| results: "asis"
-
-# --- INÍCIO DA LÓGICA REATORADA ---
-
-def processar_gleba(gleba_row, gleba_id):
+def processar_gleba(
+        gleba_row, 
+        gleba_id,
+        map_fig = True,
+        wtss_fig = True,
+        sentinel_fig = True,
+        som_fig = True
+        ):
     """
     Processa uma única gleba, gerando todas as análises e visualizações.
     """
@@ -698,20 +1369,52 @@ def processar_gleba(gleba_row, gleba_id):
 
     # Cria uma cópia para evitar SettingWithCopyWarning
     gleba_data = gleba_row.copy()
-    gleba_data['DtIniPlant'] = pd.to_datetime(gleba_data['DtIniPlant']) - pd.DateOffset(years=1)
-    gleba_data['DtFimColht'] = pd.to_datetime(gleba_data['DtFimColht']) - pd.DateOffset(years=1)
+    # Fazer parsing seguro das datas: se o valor for inválido (por ex. 'N/A'),
+    # usar errors='coerce' para produzir NaT em vez de lançar exceção.
+    for _date_col in ['DtEms', 'DtVenc', 'DtIniPlant', 'DtFimPlant', 'DtIniColht', 'DtFimColht']:
+        # gleba_data pode ser uma Series; usar .get para evitar KeyError caso a
+        # coluna não exista e permitir passagem de None para to_datetime.
+        try:
+            gleba_data[_date_col] = pd.to_datetime(gleba_data.get(_date_col), errors='coerce')
+        except Exception:
+            # Em caso inesperado, garantir que a coluna exista e contenha NaT
+            gleba_data[_date_col] = pd.NaT
 
     # Converte a linha atual de volta para um GeoDataFrame
     # É importante usar a geometria original da linha passada para a função
     glebas_gdf = gpd.GeoDataFrame([gleba_data], geometry='geometry', crs=gdf.crs)
 
-    # Extrai as datas de início e fim dinamicamente
-    start_date = gleba_data['DtIniPlant'].strftime('%Y-%m-%d')
-    end_date = gleba_data['DtFimColht'].strftime('%Y-%m-%d')
+    # Extrai as datas de início e fim dinamicamente (se disponíveis)
+    # Algumas linhas de entrada podem conter NaT se a data for inválida ou ausente.
+    if pd.notna(gleba_data.get('DtIniPlant')) and pd.notna(gleba_data.get('DtFimColht')):
+        start_date = gleba_data['DtIniPlant'].strftime('%Y-%m-%d')
+        end_date = gleba_data['DtFimColht'].strftime('%Y-%m-%d')
+        dates_available = True
+    else:
+        start_date = gleba_data['DtEms'].strftime('%Y-%m-%d')
+        end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')
+        dates_available = False
+
+
+    start_date = gleba_data['DtEms'].strftime('%Y-%m-%d')
+    end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')
+    dates_available = False
+
+    # Se as datas necessárias estiverem ausentes, pular esta etapa para evitar erros
+    if dates_available and pd.notna(gleba_data.get('DtFimPlant')) and pd.notna(gleba_data.get('DtIniColht')):
+        # gleba_4326 (geometria) e cubo_modis (objeto wtss) já estão definidos
+        planting_period = (gleba_data['DtIniPlant'].strftime('%Y-%m-%d'), gleba_data['DtFimPlant'].strftime('%Y-%m-%d'))
+        harvesting_period = (gleba_data['DtIniColht'].strftime('%Y-%m-%d'), gleba_data['DtFimColht'].strftime('%Y-%m-%d'))
+    else:
+        planting_period = None
+        harvesting_period = None
 
     # Gera um título principal para a seção desta gleba no relatório
     print(f"\nAnálise para a Gleba ID: {gleba_id}")
-    print(f"Período de Análise: {gleba_data['DtIniPlant'].strftime('%d/%m/%Y')} a {gleba_data['DtFimColht'].strftime('%d/%m/%Y')}\n")
+    if dates_available:
+        print(f"Período de Análise: {start_date} a {end_date}\n")
+    else:
+        print(f"Período de Análise: datas de plantio/colheita ausentes ou inválidas.\n Usando um ano a partir da data de emissão: {start_date} a {end_date}")
 
     # --- Início da Lógica Original do Relatório ---
     # (Todo o seu código de análise vai aqui, sem alterações)
@@ -728,320 +1431,548 @@ def processar_gleba(gleba_row, gleba_id):
     bdc_wcpms_url = 'https://data.inpe.br/bdc/wcpms'
     colecao_s2 = 'S2-16D-2'
     colecao_cbers = 'CBERS4-WFI-16D-2'
-
-    # Carrega apenas o município que cruza com a gleba, economizando memória.
-    municipio_filtrado = load_ibge_municipalities(bbox=tuple(glebas_gdf.total_bounds))
-    joined = gpd.sjoin(glebas_gdf, municipio_filtrado, how="left", predicate="intersects")
-    joined["city"] = joined["NM_MUN"]
-    joined["state"] = joined["NM_UF"]
+    colecao_landsat = 'LANDSAT-16D-1'
+    colecao_modis = 'mod13q1-6.1'
 
     gleba_geo = glebas_gdf
     crs_100000 = '+proj=aea +lon_0=-58.1835937 +lat_1=-36.5394082 +lat_2=-3.0767001 +lat_0=-1 9.8080541 +datum=WGS84 +units=m +no_defs'
     gleba_4326 = gleba_geo.to_crs('EPSG:4326').iloc[0].geometry.buffer(0)
     gleba_100000 = gleba_geo.to_crs(crs_100000).iloc[0]
     
-    mapbiomas_legend_csv = """Class_ID	Level	Description	Descricao	Color
-1	1	Forest	Floresta	#32a65e
-3	2	Forest Formation	Formação Florestal	#1f8d49
-4	2	Savanna Formation	Formação Savânica	#7dc975
-5	2	Mangrove	Mangue	#04381d
-6	2	Floodable Forest	Floresta Alagável	#026975
-49	2	Wooded Sandbank Vegetation	Restinga Arbórea	#02d659
-10	1	Herbaceous and Shrubby Vegetation	Vegetação Herbácea e Arbustiva	#ad975a
-11	2	Wetland	Campo Alagado e Área Pantanosa	#519799
-12	2	Grassland	Formação Campestre	#d6bc74
-32	2	 Hypersaline Tidal Flat	Apicum	#fc8114
-29	2	 Rocky Outcrop	Afloramento Rochoso	#ffaa5f
-50	2	 Herbaceous Sandbank Vegetation	Restinga Herbácea	#ad5100
-14	1	 Farming	Agropecuária	#FFFFB2
-15	2	 Pasture	Pastagem	#edde8e
-18	2	 Agriculture	Agricultura	#E974ED
-19	3	 Temporary Crop	Lavoura Temporária	#C27BA0
-39	4	 Soybean	Soja	#f5b3c8
-20	4	 Sugar cane	Cana	#db7093
-40	4	 Rice	Arroz	#c71585
-62	4	 Cotton (beta)	Algodão (beta)	#ff69b4
-41	4	 Other Temporary Crops	Outras Lavouras Temporárias	#f54ca9
-36	3	 Perennial Crop	Lavoura Perene	#d082de
-46	4	 Coffee	Café	#d68fe2
-47	4	 Citrus	Citrus	#9932cc
-35	4	 Palm Oil	Dendê	#9065d0
-48	4	 Other Perennial Crops	Outras Lavouras Perenes	#e6ccff
-9	2	 Forest Plantation	Silvicultura	#7a5900
-21	2	 Mosaic of Uses	Mosaico de Usos	#ffefc3
-22	1	 Non vegetated area	Área não Vegetada	#d4271e
-23	2	 Beach, Dune and Sand Spot	Praia, Duna e Areal	#ffa07a
-24	2	 Urban Area	Área Urbanizada	#d4271e
-30	2	 Mining	Mineração	#9c0027
-75	2	Photovoltaic Power Plant (beta)	Usina Fotovoltaica (beta)	#c12100
-25	2	 Other non Vegetated Areas	Outras Áreas não Vegetadas	#db4d4f
-26	1	 Water	Corpo D'água	#0000FF
-33	2	 River, Lake and Ocean	Rio, Lago e Oceano	#2532e4
-31	2	 Aquaculture	Aquicultura	#091077
-27	1	 Not Observed	Não observado	#ffffff
-"""
-    classes_mapbiomas = pd.read_csv(io.StringIO(mapbiomas_legend_csv), sep='\t')
-    raster_mapbiomas = "https://storage.googleapis.com/mapbiomas-public/initiatives/brasil/collection_10/lulc/coverage/brazil_coverage_2024.tif"
     print_status(f"2. Fontes de dados carregadas para a gleba {gleba_id}.")
 
-    fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
-    plt.show()
+    if map_fig:
+        # Carrega apenas o município que cruza com a gleba, economizando memória.
+        municipio_filtrado = load_ibge_municipalities(bbox=tuple(glebas_gdf.total_bounds))
+        joined = gpd.sjoin(glebas_gdf, municipio_filtrado, how="left", predicate="intersects")
+        joined["city"] = joined["NM_MUN"]
+        joined["state"] = joined["NM_UF"]
 
-    print_status("3. Cruzando com o raster do MapBiomas...")
-    imagem_cortada, bbox = clip_cog_raster_by_polygon(gleba_4326, raster_mapbiomas)
-    fig_mapbiomas, _ = plot(imagem_cortada, bbox, classes_mapbiomas)
-    fig_mapbiomas.set_size_inches(10, 6)
-    plt.show()
+        fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
+        plt.show()
 
-    print_status(f"4. Gerando grade de pontos com espaçamento de {grid_spacing_meters}m...")
-    pontos_aleatorios = generate_grid_points_by_distance(gleba_4326, grid_spacing_meters)
-    total_pontos = len(pontos_aleatorios)
-    print_status(f"   - Gerados {total_pontos} pontos.")
-    pontos_gdf = gpd.GeoDataFrame(geometry=pontos_aleatorios, crs="EPSG:4326")
-    gleba_gdf_plot = gpd.GeoDataFrame(geometry=[gleba_4326], crs="EPSG:4326")
-    pontos_proj = pontos_gdf.to_crs(epsg=3857)
-    gleba_proj = gleba_gdf_plot.to_crs(epsg=3857)
-    fig, ax = plt.subplots(figsize=(12, 10))
-    gleba_proj.plot(ax=ax, facecolor='none', edgecolor='yellow', linewidth=2.5, zorder=3)
-    pontos_proj.plot(ax=ax, marker='o', color='cyan', markersize=60, edgecolor='black', zorder=4)
-    from matplotlib.patheffects import withStroke
-    for idx, row in pontos_proj.iterrows():
-        ax.text(row.geometry.x + 50, row.geometry.y + 50, str(idx + 1),
-                fontsize=10, fontweight='bold', color='white',
-                path_effects=[withStroke(linewidth=2, foreground='black')], zorder=5)
-    ctx.add_basemap(ax, source=ctx.providers.Esri.WorldImagery, crs=gleba_proj.crs.to_string())
-    ax.set_axis_off()
-    ax.set_title(f'{total_pontos} Pontos de Amostragem na Gleba', fontsize=16)
-    plt.show()
 
-    # --- NEW: Function to wrap the entire WTSS initialization ---
-    def initialize_and_fetch_points():
-        # Step 1: Initialize the service and cubes (this is where the error occurred)
-        servico_wtss = wtss.WTSS(bdc_wtss_link)
-        cubo_s2 = servico_wtss[colecao_s2]
-        cubo_wfi = servico_wtss[colecao_cbers]
-        print_status(f"5. Coletando séries temporais para {total_pontos} pontos...")
-    
-        # Step 2: Fetch time series for each point (this part was already correct)
-        import matplotlib.gridspec as gridspec
-        successful_plots = 0
-        for i, ponto in enumerate(pontos_aleatorios):
-            # This inner call still needs a simple try/except because it's inside the main one
-            try:
-                print_status(f"   - Ponto {i+1}...")
-                ts_s2 = cubo_s2.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
-                ts_wfi = cubo_wfi.ts(attributes=('NDVI'), latitude=ponto.y, longitude=ponto.x, start_date=start_date, end_date=end_date)
-                
-                if not ts_s2 or not ts_wfi:
-                    print_status(f"   - AVISO: Dados de série temporal incompletos para o ponto {i+1}.")
-                    continue
-                
-                successful_plots += 1
-                fig = plt.figure(figsize=(12, 5))
-                gs = gridspec.GridSpec(1, 2, width_ratios=[3, 1])
-                ax_main = plt.subplot(gs[0])
-                ax_main.plot(ts_s2.timeline, np.array(ts_s2.NDVI)/10000, color='tab:green', alpha=0.9, linewidth=1.5, marker='o', markersize=4, label='Sentinel-2 NDVI')
-                ax_main.plot(ts_wfi.timeline, np.array(ts_wfi.NDVI)/10000, color='tab:red', alpha=0.9, linewidth=1.5, marker='x', markersize=4, label='CBERS-WFI NDVI')
-                ax_main.grid(True, linestyle='--', alpha=0.6)
-                ax_main.tick_params(axis='x', labelrotation=45)
-                ax_main.set_ylim([0.0, 1.0])
-                ax_main.set_title(f'Série Temporal NDVI - Ponto {i+1}')
-                ax_main.set_xlabel("Data"); ax_main.set_ylabel("NDVI"); ax_main.legend()
-                ax_map = plt.subplot(gs[1])
-                gpd.GeoSeries(gleba_4326).plot(ax=ax_map, color='lightgray', edgecolor='black')
-                gpd.GeoDataFrame(geometry=pontos_aleatorios).plot(ax=ax_map, marker='.', color='blue', markersize=30)
-                gpd.GeoDataFrame(geometry=[ponto]).plot(ax=ax_map, marker='*', color='red', markersize=150, edgecolor='white')
-                ax_map.set_title(f'Localização Ponto {i+1}'); ax_map.set_xticks([]); ax_map.set_yticks([])
-                fig.tight_layout()
-                plt.show()
-    
-            except Exception as e:
-                print_status(f"   - AVISO: Erro ao buscar dados para o ponto {i+1}: {e}. Pulando.")
-        
-        # If after all points, none were successful, this is noted.
-        if successful_plots == 0 and total_pontos > 0:
-             print_status(f"   - AVISO FINAL: Nenhuma série temporal foi plotada com sucesso.")
-    
-    
-    # --- MODIFIED: Call the new wrapped function within the retry handler ---
-    _, error = retry_request(
-        func=initialize_and_fetch_points,
-        name="conexão inicial e busca de séries temporais (WTSS)"
-    )
-    
-    if error:
-        print(f'Não foi possível conectar ao serviço WTSS do INPE ou obter os dados após múltiplas tentativas. Esta seção da análise foi pulada. Erro: {error}')
+    if wtss_fig:
+        # --- NOVO: Etapa 8 - Série Temporal da ÁREA (WTSS Summarize) ---
+        print_status("8. Gerando série temporal média da ÁREA (6 anos, WTSS)...")
 
-    def search_stac_items(stac_link, collection, start_date, end_date, bbox):
-        catalog = pystac_client.Client.open(stac_link)
-        search = catalog.search(collections=[collection], datetime=f'{start_date}/{end_date}', bbox=bbox)
-        return sorted(list(search.get_all_items()), key=lambda a: a.datetime, reverse=False)
+        # --- NOVO: Inicialização Centralizada do WTSS ---
+        # Inicializa o serviço uma vez para ser usado em múltiplos passos
 
-    print_status("6. Buscando e processando imagens Sentinel-2...")
-    time_ordered_items, error = retry_request(
-        func=search_stac_items,
-        name="busca de itens Sentinel-2 no catálogo STAC",
-        stac_link=bdc_stac_link,
-        collection=colecao_s2,
-        start_date=start_date,
-        end_date=end_date,
-        bbox=gleba_4326.bounds
-    )
-
-    if error:
-        print(f'Não foi possível buscar a lista de imagens de satélite do catálogo STAC do INPE. Toda a análise de imagens (recortes, RGB, EVI) foi pulada. Erro: {error}')
-        time_ordered_items = []
-
-    total_rasters = len(time_ordered_items)
-
-    print_status("7. Gerando composições RGB e EVI...")
-    if total_rasters > 0:
-        colunas = 4
-        # Calcule o número de linhas necessárias para as imagens
-        linhas_de_imagens = math.ceil(total_rasters / colunas)
-        # A altura da figura será o número de linhas de imagens vezes 2 (para RGB + EVI)
-        fig, axes = plt.subplots(
-            nrows=linhas_de_imagens * 2, 
-            ncols=colunas, 
-            figsize=(16, 6 * linhas_de_imagens),
-            gridspec_kw={'hspace': 0.3, 'wspace': 0.1}
+        servico_wtss, error = retry_request(
+            func=wtss.WTSS,
+            name="conecta nos serviços WTSS",
+            url=bdc_wtss_link
         )
-        # Achata o array de eixos para facilitar a iteração se houver mais de uma linha/coluna
-        axes = axes.flatten()
-        
-        # Esconde eixos extras que não serão usados
-        for i in range(total_rasters * 2, len(axes)):
-            axes[i].set_axis_off()
 
-        # Crie o mapa de cores de Vermelho para Verde
-        from matplotlib.colors import LinearSegmentedColormap
-        colors = [(1, 0, 0), (1, 1, 0), (0, 1, 0)] # R, Y, G
-        cmap_name = 'RdYlGn_custom'
-        cm = LinearSegmentedColormap.from_list(cmap_name, colors, N=100)
+        cubo_modis = servico_wtss[colecao_modis]
+        wtss_ready = True
 
-        t = 0
-        for item in time_ordered_items:
-            title = item.properties['datetime'][:10]
-            
-            # --- Lógica RGB ---
-            ax_rgb = axes[t * 2]
-            try:
-                banda_04_rgb = carregar_banda_sentinel2_bdc(item, 'B04', gleba_geo)
-                if banda_04_rgb.size == 0: 
-                    ax_rgb.set_title(f"{title}\n(RGB Erro)"); ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
-                    # Pula para o próximo item se a banda principal estiver vazia
-                    t += 1
-                    continue
+        fig_areal_ts, error = retry_request(
+            func=get_and_plot_areal_ts_wtss,
+            name="busca da série temporal de ÁREA (WTSS Summarize)",
+            cubo=cubo_modis,
+            gleba_4326=gleba_4326,
+            gleba_id=gleba_id,
+            planting_period=planting_period,
+            harvesting_period=harvesting_period
+        )
+        if fig_areal_ts is not None:
+            plt.show() # Mostra o gráfico gerado pela nova função
 
-                banda_08_rgb = carregar_banda_sentinel2_bdc(item, 'B08', gleba_geo)
-                banda_11_rgb = carregar_banda_sentinel2_bdc(item, 'B11', gleba_geo)
-                banda_11_zoom = resize(banda_11_rgb, banda_04_rgb.shape, order=1, preserve_range=True, anti_aliasing=True)
-                
-                L, N = 2**12, 2
-                matriz_rgb = np.zeros((banda_04_rgb.shape[0], banda_04_rgb.shape[1], 3), dtype=np.float32)
-                matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(banda_08_rgb, L), L, N) / L
-                matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(banda_11_zoom, L), L, N) / L
-                matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(banda_04_rgb, L), L, N) / L
-                
-                ax_rgb.imshow(np.clip(matriz_rgb, 0, 1))
-                ax_rgb.set_title(f"{title} (RGB)")
-                ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
 
-            except Exception as e:
-                ax_rgb.set_title(f"{title}\n(RGB Erro)"); ax_rgb.set_xticks([]); ax_rgb.set_yticks([])
+    if sentinel_fig:
+        # Renumbered to Etapa 6
+        def search_stac_items(stac_link, collection, start_date, end_date, bbox):
+            catalog = pystac_client.Client.open(stac_link)
+            search = catalog.search(collections=[collection], datetime=f'{start_date}/{end_date}', bbox=bbox)
+            return sorted(list(search.get_all_items()), key=lambda a: a.datetime, reverse=False)
 
-            # --- Lógica EVI ---
-            ax_evi = axes[t * 2 + 1]
-            try:
-                G, C1, C2, L_evi, SCALE_FACTOR = 2.5, 6.0, 7.5, 1.0, 10000.0
-                banda_scl = carregar_banda_sentinel2_bdc(item, 'SCL', gleba_geo)
-                banda_04_ref = carregar_banda_sentinel2_bdc(item, 'B04', gleba_geo)
-                if banda_04_ref.size == 0:
-                    ax_evi.set_title(f"{title}\n(EVI Erro)"); ax_evi.set_xticks([]); ax_evi.set_yticks([])
-                    t += 1
-                    continue
+        print_status("6. Buscando e processando imagens Sentinel-2...")
+        time_ordered_items, error = retry_request(
+            func=search_stac_items,
+            name="busca de itens Sentinel-2 no catálogo STAC",
+            stac_link=bdc_stac_link,
+            collection=colecao_s2,
+            start_date=start_date,
+            end_date=end_date,
+            bbox=gleba_4326.bounds
+        )
 
-                banda_scl_zoom = resize(banda_scl, banda_04_ref.shape, order=0, preserve_range=True, anti_aliasing=False)
-                banda_02 = carregar_banda_sentinel2_bdc_scl(item, 'B02', gleba_geo, banda_scl_zoom)
-                banda_04 = carregar_banda_sentinel2_bdc_scl(item, 'B04', gleba_geo, banda_scl_zoom)
-                banda_08 = carregar_banda_sentinel2_bdc_scl(item, 'B08', gleba_geo, banda_scl_zoom)
-                
-                refl_02, refl_04, refl_08 = [b.astype(np.float32) / SCALE_FACTOR for b in [banda_02, banda_04, banda_08]]
-                numerator = G * (refl_08 - refl_04)
-                denominator = (refl_08 + C1 * refl_04 - C2 * refl_02 + L_evi)
-                banda_evi = np.divide(numerator, denominator, where=denominator!=0)
-                
-                im = ax_evi.imshow(banda_evi, cmap=cm, vmin=0, vmax=1)
-                ax_evi.set_title(f"{title} (EVI)")
-                ax_evi.set_xticks([]); ax_evi.set_yticks([])
-
-            except Exception as e:
-                ax_evi.set_title(f"{title}\n(EVI Erro)"); ax_evi.set_xticks([]); ax_evi.set_yticks([])
-            
-            t += 1
-
-        # Adiciona uma única colorbar para o EVI
-        fig.subplots_adjust(right=0.9)
-        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-        fig.colorbar(im, cax=cbar_ax, label='EVI')
-        
-        plt.show()
-
-    print_status("9. Criando cubo de dados para clusterização SOM...")
-
-    cubo, mask, error = None, None, None
-    try:
-        if total_rasters > 0: # Only try if we found images in the previous step
-            cubo, mask = process_cube(shapefile=gleba_geo, query_bands=['NDVI', 'SCL'], start_date=start_date, end_date=end_date, collections=[colecao_s2], stac_url=bdc_stac_link, resolution=10)
-        else:
-            # Don't set an error, just acknowledge there's nothing to process
-            print_status("   - AVISO: Nenhuma imagem encontrada no passo anterior. Análise SOM pulada.")
-    except Exception as e:
-        error = e
-        print_status(f"ERRO: Falha ao processar o cubo de dados para SOM: {e}")
-
-    if error or cubo is None:
-        # Only print error message if there was an actual error
         if error:
-            print(f'Não foi possível gerar o cubo de dados do serviço do INPE necessário para a análise SOM. Esta seção foi pulada. Erro: {error}')
+            print(f'Não foi possível buscar a lista de imagens de satélite do catálogo STAC do INPE. Toda a análise de imagens (recortes, RGB, EVI) foi pulada. Erro: {error}')
+            time_ordered_items = []
 
-    elif 'time' in cubo.dims and len(cubo.time) > 1:
-        sqrt_n = 3
-        print_status("10. Executando clusterização SOM...")
-        result, neuron_weights, predictions, som = som_time_series_clustering(cubo, mask, n=sqrt_n, random_seed=123, training_steps=100)
-        num_clusters = sqrt_n * sqrt_n
-        base_cmap = plt.get_cmap('tab20', num_clusters)
-        color_list = [base_cmap(i) for i in range(num_clusters)]
-        cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
-        
+        # Renumbered to Etapa 7
+        total_rasters = len(time_ordered_items)
 
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [4, 3]})
-        plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1)
-        plot_cluster_image(predictions, cmap, ax=ax2, show_colorbar=False)
-        fig.suptitle('Análise de Clusters SOM', fontsize=16)
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-        plt.show()
+        print_status("7. Gerando composições RGB e EVI...")
+        if total_rasters > 0:
+            merged_assets = merge_assets_by_date(time_ordered_items, gleba_geo)
+            nrows = len(merged_assets)
+            ncols = 2  # RGB | EVI
+            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, 3 * nrows), squeeze=False)
+            cm = plt.get_cmap('turbo')
 
-        # print("\n#### Matriz-U (Fronteiras dos Clusters)\n")
-        # print('::: {.cell}\n::: {.cell-output-display}\n*Fig. Matriz-U do SOM, mostrando a separabilidade entre os clusters.*\n:::\n:::')
-        # fig_som_u_matrix, _ = plot_som_u_matrix(som)
-        # plt.title('Matriz-U do SOM (Fronteiras entre Clusters)')
-        # plt.show()
+            for i, (date, assets) in enumerate(merged_assets.items()):
+                ax_rgb = axes[i, 0]
+                ax_evi = axes[i, 1]
+
+                # RGB (left)
+                if assets.get('rgb') is not None:
+                    ax_rgb.imshow(np.clip(assets['rgb'], 0, 1))
+                    ax_rgb.set_title(f"{date} (RGB)")
+                else:
+                    ax_rgb.text(0.5, 0.5, 'RGB Erro', ha='center', va='center')
+                    ax_rgb.set_title(f"{date} (RGB)")
+                ax_rgb.set_xticks([])
+                ax_rgb.set_yticks([])
+
+                # EVI (right) with colorbar
+                if assets.get('evi') is not None:
+                    im = ax_evi.imshow(assets['evi'], cmap=cm, vmin=0, vmax=1)
+                    ax_evi.set_title(f"{date} (EVI)")
+                    cax = fig.colorbar(im, ax=ax_evi, fraction=0.046, pad=0.04)
+                    cax.set_label('EVI')
+                else:
+                    ax_evi.text(0.5, 0.5, 'EVI Erro', ha='center', va='center')
+                    ax_evi.set_title(f"{date} (EVI)")
+                ax_evi.set_xticks([])
+                ax_evi.set_yticks([])
+
+            # Hide any unused axes if total_rasters > len(merged_assets)
+            for j in range(i + 1, nrows):
+                for k in range(ncols):
+                    axes[j, k].axis('off')
+
+            plt.tight_layout()
+            # plt.show()
+
+    if som_fig:
+        print_status("9. Criando cubo de dados para clusterização SOM...") # Renumbered
+
+        cubo, mask, error = None, None, None
+        try:
+            if total_rasters > 0 and start_date is not None and end_date is not None: # Only try if we found images and dates are available
+                cubo, mask = process_cube(shapefile=gleba_geo, query_bands=['NDVI', 'SCL'], start_date=start_date, end_date=end_date, collections=[colecao_s2], stac_url=bdc_stac_link, resolution=10)
+            else:
+                # Don't set an error, just acknowledge there's nothing to process
+                if total_rasters == 0:
+                    print_status("   - AVISO: Nenhuma imagem encontrada no passo anterior. Análise SOM pulada.")
+                else:
+                    print_status("   - AVISO: Datas ausentes — processamento do cubo para SOM pulado.")
+        except Exception as e:
+            error = e
+            print_status(f"ERRO: Falha ao processar o cubo de dados para SOM: {e}")
+
+        if error or cubo is None:
+            # Only print error message if there was an actual error
+            if error: # This condition is redundant with the outer if, but keeping it as per original structure
+                print(f'Não foi possível gerar o cubo de dados do serviço do INPE necessário para a análise SOM. Esta seção foi pulada. Erro: {error}')
+
+        elif 'time' in cubo.dims and len(cubo.time) > 1:
+            sqrt_n = 3
+            print_status("10. Executando clusterização SOM...")
+            result, neuron_weights, predictions, som = som_time_series_clustering(cubo, mask, n=sqrt_n, random_seed=123, training_steps=100)
+            num_clusters = sqrt_n * sqrt_n
+            base_cmap = plt.get_cmap('tab20', num_clusters)
+            color_list = [base_cmap(i) for i in range(num_clusters)]
+            cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
+            
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [4, 3]})
+            plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1)
+            plot_cluster_image(predictions, cmap, ax=ax2, show_colorbar=False)
+            fig.suptitle('Análise de Clusters SOM', fontsize=16)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.show()
+
+        else:
+            print_status("   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.") 
+
+
+
+```
+
+
+```{python}
+#| results: "asis"
+#| tbl-cap-location: top
+#| echo: false
+
+# Carregamento do XML e criação do GeoDataFrame
+try:
+    with open(f'{ref_bacen}_{produtor}.xml', 'r', encoding='utf-16be') as f:
+    #with open(f'{ref_bacen}_{produtor}.xml', 'r', encoding='utf-8') as f:
+        xml_content = f.read()
+except FileNotFoundError:
+    print_status(f"ERRO: O arquivo {ref_bacen}_{produtor}.xml não foi encontrado.")
+    xml_content = None
+except Exception as e:
+    print_status(f"ERRO ao ler o arquivo XML: {e}")
+    xml_content = None
+
+if xml_content:
+    try:
+        gdf = parse_xml_to_gdf_all_fields(xml_content)
+    except Exception as e:
+        print_status(f"ERRO ao parsear o XML para GeoDataFrame: {e}")
+        gdf = None
+else:
+    gdf = None
+
+# Verificação se o GDF foi criado
+if gdf is None or gdf.empty:
+    print_status("ERRO: GeoDataFrame não pôde ser criado ou está vazio. O relatório não pode continuar.")
+    # Interrompe a execução do Quarto aqui, se possível (em um script normal, usaríamos sys.exit)
+    raise SystemExit("Parando a execução devido à falha no carregamento dos dados.")
+```
+
+## Dados Cadastrais
+
+```{python}
+#| tbl-cap: "Resumo Geral da Operação de Crédito"
+#| echo: false
+
+# Projeção e cálculo de área
+area_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+property_aea = gdf.to_crs(area_proj)
+area_ha = property_aea[['geometry']].dissolve().geometry.area.sum() / 10000
+
+# Extrair CNPJ/CPF do primeiro beneficiário do JSON
+cnpj_cpf = "N/A"
+if 'Beneficiarios' in gdf.columns:
+    try:
+        beneficiarios_list = json.loads(gdf['Beneficiarios'].iloc[0])
+        if beneficiarios_list:
+            cnpj_cpf = beneficiarios_list[0].get('CNPJ_CPFBenfcrio', 'N/A')
+    except (json.JSONDecodeError, IndexError):
+        cnpj_cpf = "Erro ao ler JSON de Beneficiários"
+
+# Dados cadastrais
+dados_cadastrais = {
+    'Instituição Financeira:': 'BOCOM BBM',
+    'Produtor:': produtor,
+    'CPF / CNPJ:': cnpj_cpf,
+    'REFBACEN:': ref_bacen,
+    'Área Financiada (ha):': f"{area_ha:,.2f}",
+    'Receita esperada (BRL):': f"{gdf['VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum():,.2f}"
+}
+
+df = pd.DataFrame(list(dados_cadastrais.items()), columns=['Atributo', 'Valor'])
+
+plot_df_as_table(df, col_widths=[0.4, 0.6], is_kv_style=True)
+
+```
+
+## Imóveis Associados
+
+```{python}
+#| echo: false
+
+# 1. Obter a coluna 'Properties' (que contém strings JSON)
+properties_json_series = gdf['Properties']
+
+# 2. Parsear cada string JSON para uma lista de dicionários
+all_properties_list_of_lists = properties_json_series.apply(json.loads)
+
+# 3. Combinar todas as listas de propriedades em uma única lista
+combined_properties_list = []
+if not all_properties_list_of_lists.empty:
+    combined_properties_list = all_properties_list_of_lists.sum()
+
+# 4. Criar o DataFrame e remover duplicatas
+if combined_properties_list:
+    df = pd.DataFrame(combined_properties_list).drop_duplicates().reset_index(drop=True)
+    
+    # Reordenar colunas para uma ordem lógica e combinar col_widths
+    # As colunas são: TpPessoaPropt, CNPJBase_CPFPropt, NIRF, CodSNCR, NumRegCAR
+    df = df[['NIRF', 'CodSNCR', 'NumRegCAR']]
+    
+    # Ajustar col_widths para 5 colunas
+    plot_df_as_table(df, title="Imóveis Associados à Operação", col_widths=[0.15, 0.25, 0.6])
+else:
+    display(Markdown("Nenhum imóvel associado encontrado."))
+
+```
+
+```{python}
+#| fig-width: 10
+#| echo: false
+
+# Carregar o CSV de empreendimentos
+codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252')
+
+# Renomear a coluna no CSV para corresponder ao gdf
+codempreendimento_df = codempreendimento_df.rename(columns={'#CODIGO':'CodEmpnmnt'})
+
+# Garantir que a chave de junção seja string em ambos
+codempreendimento_df['CodEmpnmnt'] = codempreendimento_df['CodEmpnmnt'].astype(str)
+gdf['CodEmpnmnt'] = gdf['CodEmpnmnt'].astype(str)
+
+# Fazer o merge no gdf para adicionar 'PRODUTO' e outras infos
+# Isso adiciona as colunas do CSV (como 'PRODUTO') ao nosso gdf
+gdf = gdf.merge(codempreendimento_df, how='left', on='CodEmpnmnt')
+
+# Carregar o CSV de tipos de solo
+tiposolo_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/TipoSoloProagro.csv', encoding='windows-1252', sep=';')
+tiposolo_df = tiposolo_df.rename(columns={'#CODIGO_TIPO_SOLO': 'TpSolo', '#DESCRICAO_TIPO_SOLO': 'DescricaoSolo'})
+
+# Extrair 'TpSolo' do JSON 'ZARC' e fazer o merge
+gdf['TpSolo'] = gdf['ZARC'].apply(lambda x: json.loads(x)[0].get('TpSolo') if x and x != '[]' else None)
+gdf['TpSolo'] = pd.to_numeric(gdf['TpSolo'], errors='coerce')
+gdf = gdf.merge(tiposolo_df, how='left', on='TpSolo')
+
+# Carrega apenas o município que cruza com a gleba, economizando memória.
+municipio_filtrado = load_ibge_municipalities(bbox=tuple(gdf.total_bounds))
+joined = gpd.sjoin(gdf, municipio_filtrado, how="left", predicate="intersects")
+joined["city"] = joined["NM_MUN"]
+joined["state"] = joined["NM_UF"]
+
+fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)
+plt.show()
+
+
+```
+
+\newpage
+
+# Detalhes por Empreendimento
+
+```{python}
+#| fig-width: 10
+#| echo: false
+
+# 1. Explodir o gdf UMA VEZ para ter uma linha por gleba (polígono individual)
+#    Mantendo os dados do empreendimento (row) associados a cada gleba
+# index_parts=True é importante se os MultiPolygons tiverem mais de uma parte
+exploded_gdf = gdf.explode(index_parts=True).reset_index()
+# 'index' será o índice original (0, 1, ... para cada empreendimento)
+exploded_gdf = exploded_gdf.rename(columns={'level_0': 'empreendimento_id', 'level_1': 'gleba_id'})
+
+
+# 2. Iterar por cada *EMPREENDIMENTO* (destino) original
+#    gdf.iterrows() itera sobre o DataFrame *antes* do explode
+for i, dest_row in gdf.iterrows():
+    
+    #display(Markdown(r"\newpage"))
+
+    display(Markdown(f"## Empreendimento {i+1}"))
+
+    cols_to_exclude = ['geometry', 'Beneficiarios', 'Properties', 'Parcels', 'ZARC',
+    'IdentdEmissor', 'IdentdDestinatario', 'DomSist', 'NUOp', 'CodMsg', 'NumCtrlIF', 'CNPJEntRespons', 'DtEms', 'DtVenc', 'NumCedlCredRuralIF', 'TpInstntoCred', 'VlrTotOp', 'CodPorteBenfcrio', 'DtMovto', 'CodSistProdc', 'CD_TIPO_CULTURA',
+    'DATA_INICIO','DATA_FIM','VlrParclRecProprio', 'CEDULA_MAE', 'CodProg_LinhaCred', 'TpFnteRec', 'TpEncargoFinancCompltar', 'QtdPrvProdc', 'CodModSegr', 'VlrReceitaBrutEsprdEmpnmnt', 'VARIEDADE', 'ZONEAMENTO', 'UNIDADE_MEDIDA', 'UNIDADE_MEDIDA_PREVISAO','CONSORCIO'#, 'TpSolo'
+    ]
+    dest_series = dest_row.drop(labels=cols_to_exclude, errors='ignore')
+    dest_details_df = pd.DataFrame(dest_series).reset_index()
+    dest_details_df.columns = ["Atributo", "Valor"]
+    
+    plot_df_as_table(
+        dest_details_df, 
+        col_widths=[0.4, 0.6], 
+        is_kv_style=True,
+        fig_height_scale=0.35 # Reduz a altura por linha
+    )
+    
+    cod_emp = dest_row['CodEmpnmnt']
+
+    # Pega as glebas *deste* empreendimento no gdf explodido
+    # 'i' é o índice original da linha de 'dest_row'
+    gdf_empreendimento_glebas = exploded_gdf[exploded_gdf['empreendimento_id'] == i]
+    
+    if not gdf_empreendimento_glebas.empty:
+        property_aea_emp = gdf_empreendimento_glebas.to_crs(area_proj)
+        area_ha_emp = property_aea_emp.geometry.area.sum() / 10000
     else:
-        print_status("   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.")
+        area_ha_emp = 0
+
+    # Cultura específica (já está no dest_row do merge anterior)
+    cultura_emp = dest_row.get('PRODUTO', 'Não informado')
+    qtd_prod_emp = dest_row.get('QtdPrvProdc', 'N/A')
+
+    produtividade = float(qtd_prod_emp)*1000 / float(area_ha_emp) if area_ha_emp > 0 else 'N/A'
+    
+    # Cria a tabela de desvios
+    area_financiada_df_emp = pd.DataFrame([
+        ["Área do cultivo (ha):", "", f"{area_ha_emp:,.2f}", ""],
+        ["Área outros cultivos (ha):", "", "-", ""], # Valor parece estático no original
+        ["Área sem cultivo (ha):", "", "-", ""], # Valor parece estático no original
+        ["Cultura:", "", cultura_emp, ""], # Valor parece estático no original
+        ["Desenv. Vegetativo Alcançado:", "", "-", ""], # Valor parece estático no original
+        ["Expectativa de produtividade (Kg/ha):", "",f"{float(produtividade):,.2f}" , ""], # Valor parece estático no original
+        ["Expectativa de produção (Kg):", "", f"{float(qtd_prod_emp)*1000:,.2f}", ""]
+    ], columns=["Descrição", "Dados observados", "Dados informados", "Relevância"])
+
+    plot_df_as_table(
+        area_financiada_df_emp,
+        title = f"Análise dos Desvios Verificados para o Empreendimento {i+1}",
+        col_widths=[0.45, 0.2, 0.25, 0.1],
+        fig_height_scale=0.55,
+        font_size=10,
+        bold_first_col=True
+    )
+
+    # Cria um bloco de texto para a conclusão, com espaço para escrita e linha de assinatura.
+    conclusion_text = f"""
+### Conclusão quanto a análise do empreendimento {i+1}:
+
+.
+
+.
+
+.
+
+.
+
+.
+
+.
+
+---
+
+**Assinatura do Responsável pelo Laudo**
+
+"""
+    display(Markdown(conclusion_text))
+
+    display(Markdown(r"\newpage"))
+
+    # 3. Iterar sobre cada *GLEBA* (talhão) deste empreendimento
+    #    Itera sobre o dataframe *explodido* e filtrado
+    for _, gleba_row in gdf_empreendimento_glebas.iterrows():
+        
+        # 'gleba_id' foi criado no reset_index do explode
+        gleba_id = gleba_row['gleba_id']
+        
+        display(Markdown(f"### Análise do Talhão ID: {gleba_id} (Empreendimento {i+1})"))
+
+        # Chama a função principal, que cuida de tudo
+        # A função 'processar_gleba' não foi fornecida, mas a lógica de chamada está correta
+        processar_gleba(
+            gleba_row, 
+            gleba_id,
+            map_fig = True,
+            wtss_fig = True,
+            sentinel_fig = False,
+            som_fig = False
+        )
+
+        #break
+    #break
 
 
-# --- Bloco Principal do Relatório ---
+```
 
-# Explode o GeoDataFrame para garantir que cada polígono individual seja processado.
-# exploded_gdf = gdf.explode(index_parts=True).iloc[[0]] # Remova o .iloc[[0]] para rodar para todas
-exploded_gdf = gdf.explode(index_parts=True)
+## Metodologia
 
-# Itera sobre cada gleba e chama a função de processamento
-for index, gleba_row in exploded_gdf.iterrows():
-    # O índice pode ser um tuple (se index_parts=True), então pegamos o ID original
-    gleba_id = index[0] if isinstance(index, tuple) else index
+Este relatório utiliza dados de sensoriamento remoto para análise e monitoramento das operações de crédito rural, combinando diferentes fontes e técnicas para gerar informações precisas sobre as propriedades financiadas.
 
-    # Chama a função principal, que cuida de tudo
-    processar_gleba(gleba_row, gleba_id)
+### Fontes de Dados de Sensoriamento Remoto
+
+- **MODIS (Moderate Resolution Imaging Spectroradiometer)**  
+  Utilizado para a geração das séries temporais médias de índices de vegetação, especialmente o NDVI (Normalized Difference Vegetation Index). Os dados MODIS possuem resolução espacial moderada (aproximadamente 250 metros) e alta frequência temporal, permitindo a análise de tendências fenológicas ao longo de vários anos (neste caso, até 6 anos). A série temporal é suavizada para reduzir ruídos e facilitar a interpretação.
+
+- **Sentinel-2**  
+  Utilizado para a geração de composições de imagens RGB e cálculo do índice EVI (Enhanced Vegetation Index) com alta resolução espacial (10 metros). As imagens Sentinel-2 são adquiridas em intervalos regulares e processadas para compor mosaicos mensais, permitindo uma análise detalhada da cobertura vegetal e condições das glebas. A máscara de nuvens é aplicada para garantir a qualidade dos dados.
+
+### Índices de Vegetação
+
+- **NDVI (Normalized Difference Vegetation Index)**  
+  Índice amplamente utilizado para monitorar a saúde e vigor da vegetação, calculado a partir das bandas do vermelho e do infravermelho próximo. O NDVI é extraído das séries temporais MODIS para análise fenológica e detecção de variações ao longo do tempo.
+
+- **EVI (Enhanced Vegetation Index)**  
+  Índice que melhora a sensibilidade em áreas com alta biomassa e reduz efeitos atmosféricos, calculado a partir das bandas do Sentinel-2. O EVI é utilizado para composições mensais de imagens, fornecendo uma visão detalhada da condição da vegetação nas glebas.
+
+### Resoluções Espacial e Temporal
+
+- A resolução espacial dos dados MODIS é de aproximadamente 250 metros, adequada para análises em escala regional e séries temporais longas.  
+- As imagens Sentinel-2 possuem resolução espacial de 10 metros, permitindo análises detalhadas e precisas das propriedades rurais.  
+- Temporalmente, as séries MODIS são analisadas em intervalos mensais e anuais para capturar tendências fenológicas, enquanto as imagens Sentinel-2 são compostas mensalmente para reduzir a interferência de nuvens e melhorar a cobertura espacial.
+
+### Modelo de Clusterização
+
+Para identificar padrões espaciais e temporais na dinâmica da vegetação, é aplicada a técnica de **Self-Organizing Maps (SOM)**, um método de aprendizado não supervisionado que organiza dados multidimensionais em uma grade bidimensional preservando a topologia dos dados.
+
+- O SOM é treinado com as séries temporais de NDVI extraídas das imagens Sentinel-2, considerando apenas pixels válidos após aplicação de máscara de nuvens e recorte espacial.  
+- A clusterização permite agrupar áreas com comportamentos fenológicos semelhantes, facilitando a identificação de diferentes perfis de desenvolvimento vegetativo dentro das glebas.  
+- O número de clusters é definido com base na dimensão da grade SOM, e os resultados são visualizados tanto em mapas espaciais quanto em perfis temporais médios por cluster.
+
+Esta abordagem integrada, combinando diferentes sensores, índices e técnicas de análise, possibilita uma avaliação robusta e detalhada das condições das propriedades rurais financiadas, apoiando a fiscalização e o monitoramento ambiental.
+
+---
+
+## Glossário de Termos
+
+- **MODIS (Moderate Resolution Imaging Spectroradiometer)**: Sensor de satélite que fornece imagens com resolução espacial moderada e alta frequência temporal, utilizado para monitoramento ambiental em larga escala.
+
+- **Sentinel-2**: Satélite do programa Copernicus que fornece imagens ópticas de alta resolução espacial, utilizadas para análise detalhada da cobertura vegetal.
+
+- **NDVI (Normalized Difference Vegetation Index)**: Índice de vegetação que mede a saúde e vigor da vegetação com base na reflectância do vermelho e do infravermelho próximo.
+
+- **EVI (Enhanced Vegetation Index)**: Índice de vegetação que melhora a sensibilidade em áreas com alta biomassa e reduz interferências atmosféricas.
+
+- **Self-Organizing Map (SOM)**: Técnica de aprendizado não supervisionado que organiza dados multidimensionais em uma grade bidimensional, preservando relações topológicas para facilitar a clusterização.
+
+- **Clusterização**: Processo de agrupar dados com características semelhantes para identificar padrões ou categorias.
+
+- **Máscara de nuvens**: Técnica aplicada em imagens de satélite para identificar e excluir pixels cobertos por nuvens, garantindo a qualidade dos dados analisados.
+
+- **Gleba**: Unidade territorial delimitada dentro de uma propriedade rural, geralmente um talhão ou parcela agrícola.
+
+- **Série temporal**: Conjunto de dados coletados sequencialmente ao longo do tempo, utilizado para análise de tendências e padrões.
+
+- **Resolução espacial**: Tamanho do menor objeto que pode ser detectado em uma imagem de satélite, geralmente medido em metros.
+
+- **Resolução temporal**: Frequência com que imagens ou dados são coletados para uma mesma área.
+
+
+## Anexos
+
+```{python}
+#| fig-width: 10
+#| echo: false
+
+# 1. Explodir o gdf UMA VEZ para ter uma linha por gleba (polígono individual)
+#    Mantendo os dados do empreendimento (row) associados a cada gleba
+# index_parts=True é importante se os MultiPolygons tiverem mais de uma parte
+exploded_gdf = gdf.explode(index_parts=True).reset_index()
+# 'index' será o índice original (0, 1, ... para cada empreendimento)
+exploded_gdf = exploded_gdf.rename(columns={'level_0': 'empreendimento_id', 'level_1': 'gleba_id'})
+
+
+# 2. Iterar por cada *EMPREENDIMENTO* (destino) original
+#    gdf.iterrows() itera sobre o DataFrame *antes* do explode
+for i, dest_row in gdf.iterrows():
+    
+    #display(Markdown(r"\newpage"))
+
+    gdf_empreendimento_glebas = exploded_gdf[exploded_gdf['empreendimento_id'] == i]
+
+
+    display(Markdown(f"## Empreendimento {i+1}"))
+
+    # 3. Iterar sobre cada *GLEBA* (talhão) deste empreendimento
+    #    Itera sobre o dataframe *explodido* e filtrado
+    for _, gleba_row in gdf_empreendimento_glebas.iterrows():
+        
+        # 'gleba_id' foi criado no reset_index do explode
+        gleba_id = gleba_row['gleba_id']
+        
+        #display(Markdown(f"### Análise do Talhão ID: {gleba_id} (Empreendimento {i+1})"))
+
+        # Chama a função principal, que cuida de tudo
+        # A função 'processar_gleba' não foi fornecida, mas a lógica de chamada está correta
+        processar_gleba(
+            gleba_row, 
+            gleba_id,
+            map_fig = False,
+            wtss_fig = False,
+            sentinel_fig = True,
+            som_fig = True
+        )
+
+        #break
+    #break
+
+
 ```
