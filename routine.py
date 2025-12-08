@@ -151,7 +151,7 @@ if __name__ == '__main__':
                     local_file_path=output_filename,
                     blob_container=output_container,
                     blob_path=output_blob_path,
-                    delete_original_file=True
+                    delete_original_file=False
                 )
 
         except FileNotFoundError:

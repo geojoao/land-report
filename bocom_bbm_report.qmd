@@ -19,8 +19,8 @@ params:
 #| tags: [parameters]
 #| include: false
 
-produtor = "Straglioto"
-ref_bacen = "513438999"
+produtor = " Bom Jesus"
+ref_bacen = "20241906129"
 ```
 
 ```{python}
@@ -383,20 +383,45 @@ except ImportError:
  
 def load_ibge_municipalities(bbox=None):
     """
-    Downloads, extracts, and loads IBGE municipalities, optionally filtered by a bounding box.
-    Filtering by bbox significantly reduces memory usage.
+    Downloads (if not cached), extracts, and loads IBGE municipalities.
+    Caches the file in /tmp to avoid repeated downloads.
     """
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_Municipios_2024.zip"
-   
-    # Construct a fsspec-compatible URI to read the shapefile directly from the zip
-    # This is the most robust and memory-efficient way.
-    uri = f"zip+{url}!BR_Municipios_2024.shp"
- 
+    local_path = "/tmp/BR_Municipios_2024.zip"
+
+    # 1. Check if file exists locally
+    if not os.path.exists(local_path):
+        print(f"File not found in {local_path}. Downloading from IBGE...")
+        try:
+            response = requests.get(url, stream=True)
+            response.raise_for_status() # Check for HTTP errors
+            
+            # Write file in chunks to avoid memory issues with large files
+            with open(local_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print("Download complete.")
+            
+        except Exception as e:
+            # Clean up partial file if download fails
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            raise e
+    else:
+        #print(f"Loading cached file from {local_path}...")
+        pass
+
+    # 2. Construct URI for the LOCAL zip file
+    # Note: 'zip://' is used for local files, 'zip+https://' is for remote
+    uri = f"zip://{local_path}!BR_Municipios_2024.shp"
+
+    # 3. Load with GeoPandas
     gdf = gpd.read_file(uri, bbox=bbox)
     gdf = gdf.to_crs("EPSG:4326")
+    
     return gdf
  
- 
+
 def load_ibge_states():
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip"
     r = requests.get(url)
@@ -1509,44 +1534,55 @@ def processar_gleba(
         print_status("7. Gerando composições RGB e EVI...")
         if total_rasters > 0:
             merged_assets = merge_assets_by_date(time_ordered_items, gleba_geo)
-            nrows = len(merged_assets)
+            
+            # Convert dictionary to list to allow slicing
+            asset_list = list(merged_assets.items())
+            
+            batch_size = 3
             ncols = 2  # RGB | EVI
-            fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, 3 * nrows), squeeze=False)
             cm = plt.get_cmap('turbo')
 
-            for i, (date, assets) in enumerate(merged_assets.items()):
-                ax_rgb = axes[i, 0]
-                ax_evi = axes[i, 1]
+            # Iterate through the assets in chunks of 3
+            for start_idx in range(0, len(asset_list), batch_size):
+                # Get the current batch of 3 (or fewer for the last page)
+                batch = asset_list[start_idx : start_idx + batch_size]
+                nrows = len(batch)
+                
+                # Create a new figure for this page
+                # Adjusted height (4 * nrows) to ensure images aren't too squashed
+                fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10, 4 * nrows), squeeze=False)
+                
+                for i, (date, assets) in enumerate(batch):
+                    ax_rgb = axes[i, 0]
+                    ax_evi = axes[i, 1]
 
-                # RGB (left)
-                if assets.get('rgb') is not None:
-                    ax_rgb.imshow(np.clip(assets['rgb'], 0, 1))
-                    ax_rgb.set_title(f"{date} (RGB)")
-                else:
-                    ax_rgb.text(0.5, 0.5, 'RGB Erro', ha='center', va='center')
-                    ax_rgb.set_title(f"{date} (RGB)")
-                ax_rgb.set_xticks([])
-                ax_rgb.set_yticks([])
+                    # RGB (left)
+                    if assets.get('rgb') is not None:
+                        ax_rgb.imshow(np.clip(assets['rgb'], 0, 1))
+                        ax_rgb.set_title(f"{date} (RGB)")
+                    else:
+                        ax_rgb.text(0.5, 0.5, 'RGB Erro', ha='center', va='center')
+                        ax_rgb.set_title(f"{date} (RGB)")
+                    ax_rgb.set_xticks([])
+                    ax_rgb.set_yticks([])
 
-                # EVI (right) with colorbar
-                if assets.get('evi') is not None:
-                    im = ax_evi.imshow(assets['evi'], cmap=cm, vmin=0, vmax=1)
-                    ax_evi.set_title(f"{date} (EVI)")
-                    cax = fig.colorbar(im, ax=ax_evi, fraction=0.046, pad=0.04)
-                    cax.set_label('EVI')
-                else:
-                    ax_evi.text(0.5, 0.5, 'EVI Erro', ha='center', va='center')
-                    ax_evi.set_title(f"{date} (EVI)")
-                ax_evi.set_xticks([])
-                ax_evi.set_yticks([])
+                    # EVI (right) with colorbar
+                    if assets.get('evi') is not None:
+                        im = ax_evi.imshow(assets['evi'], cmap=cm, vmin=0, vmax=1)
+                        ax_evi.set_title(f"{date} (EVI)")
+                        cax = fig.colorbar(im, ax=ax_evi, fraction=0.046, pad=0.04)
+                        cax.set_label('EVI')
+                    else:
+                        ax_evi.text(0.5, 0.5, 'EVI Erro', ha='center', va='center')
+                        ax_evi.set_title(f"{date} (EVI)")
+                    ax_evi.set_xticks([])
+                    ax_evi.set_yticks([])
 
-            # Hide any unused axes if total_rasters > len(merged_assets)
-            for j in range(i + 1, nrows):
-                for k in range(ncols):
-                    axes[j, k].axis('off')
-
-            plt.tight_layout()
-            # plt.show()
+                plt.tight_layout()
+                plt.show()
+                
+                # Force a page break after every plot group
+                display(Markdown(r"\newpage"))
 
     if som_fig:
         print_status("9. Criando cubo de dados para clusterização SOM...") # Renumbered
@@ -1687,7 +1723,7 @@ if combined_properties_list:
     
     # Reordenar colunas para uma ordem lógica e combinar col_widths
     # As colunas são: TpPessoaPropt, CNPJBase_CPFPropt, NIRF, CodSNCR, NumRegCAR
-    df = df[['NIRF', 'CodSNCR', 'NumRegCAR']]
+    df = df[['NIRF', 'CodSNCR', 'NumRegCAR']].drop_duplicates().reset_index(drop=True)
     
     # Ajustar col_widths para 5 colunas
     plot_df_as_table(df, title="Imóveis Associados à Operação", col_widths=[0.15, 0.25, 0.6])
@@ -1857,11 +1893,15 @@ for i, dest_row in gdf.iterrows():
             som_fig = False
         )
 
+        display(Markdown(r"\newpage"))
+
         #break
     #break
 
 
 ```
+
+\newpage
 
 ## Metodologia
 
@@ -1899,7 +1939,6 @@ Para identificar padrões espaciais e temporais na dinâmica da vegetação, é 
 
 Esta abordagem integrada, combinando diferentes sensores, índices e técnicas de análise, possibilita uma avaliação robusta e detalhada das condições das propriedades rurais financiadas, apoiando a fiscalização e o monitoramento ambiental.
 
----
 
 ## Glossário de Termos
 
@@ -1925,6 +1964,7 @@ Esta abordagem integrada, combinando diferentes sensores, índices e técnicas d
 
 - **Resolução temporal**: Frequência com que imagens ou dados são coletados para uma mesma área.
 
+\newpage
 
 ## Anexos
 
@@ -1970,6 +2010,20 @@ for i, dest_row in gdf.iterrows():
             sentinel_fig = True,
             som_fig = True
         )
+
+        display(Markdown(f"### Coordenadas do Talhão ID: {gleba_id} (Empreendimento {i+1})"))
+
+        # Extrai as coordenadas e cria um DataFrame
+        coords = list(gleba_row.geometry.exterior.coords)
+        coords_df = pd.DataFrame(coords, columns=['Longitude', 'Latitude'])
+
+        # Plota a tabela de coordenadas
+        plot_df_as_table(
+            coords_df,
+            title=f"Vértices do Talhão {gleba_id}"
+        )
+
+        display(Markdown(r"\newpage"))
 
         #break
     #break

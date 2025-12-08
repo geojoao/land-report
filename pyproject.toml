@@ -13,7 +13,7 @@ dependencies = [
     "SQLAlchemy",
     "pystac-client",
     "shapely",
-    "wtss", # Web Time Series Service client
+    "wtss==2.0.0a3", # Web Time Series Service client
     "wcpms @ git+https://github.com/brazil-data-cube/wcpms.py.git",
     "scikit-image",
     "kaleido",
@@ -29,5 +29,6 @@ dependencies = [
     "jupyter",
     "papermill",
     "azure-storage-blob",
-    "tabulate"
+    "tabulate",
+    "update>=0.0.1",
 ]
