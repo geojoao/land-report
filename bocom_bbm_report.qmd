@@ -391,16 +391,29 @@ def load_ibge_municipalities(bbox=None):
 
     # 1. Check if file exists locally
     if not os.path.exists(local_path):
-        print(f"File not found in {local_path}. Downloading from IBGE...")
+        print_status(f"File not found in {local_path}. Downloading from IBGE...")
+        
+        response, error = retry_request(
+            func=requests.get,
+            name="download de municípios do IBGE",
+            url=url,
+            stream=True
+        )
+
+        if error:
+            # Clean up partial file if download fails
+            if os.path.exists(local_path):
+                os.remove(local_path)
+            raise RuntimeError(error)
+
         try:
-            response = requests.get(url, stream=True)
             response.raise_for_status() # Check for HTTP errors
             
             # Write file in chunks to avoid memory issues with large files
             with open(local_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
-            print("Download complete.")
+            print_status("Download complete.")
             
         except Exception as e:
             # Clean up partial file if download fails
@@ -424,8 +437,17 @@ def load_ibge_municipalities(bbox=None):
 
 def load_ibge_states():
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_UF_2024.zip"
-    r = requests.get(url)
-    z = zipfile.ZipFile(io.BytesIO(r.content))
+    
+    response, error = retry_request(
+        func=requests.get,
+        name="download de estados do IBGE",
+        url=url
+    )
+
+    if error:
+        raise RuntimeError(error)
+
+    z = zipfile.ZipFile(io.BytesIO(response.content))
     shp_path = [f for f in z.namelist() if f.endswith(".shp") and 'UF' in f][0]
     z.extractall("ibge_states")
     gdf = gpd.read_file(f"ibge_states/{shp_path}")
@@ -457,13 +479,7 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
     area_ha = property_aea.geometry.area.iloc[0] / 10000
     area_m2 = property_aea.geometry.area.iloc[0]
     perimeter_m = property_aea.geometry.length.iloc[0]
- 
-    # Calculate additional metrics
-    pa_ratio = perimeter_m / area_m2 if area_m2 > 0 else 0
-    circle = property_gdf.minimum_bounding_circle().to_crs(brazil_aea_proj)
-    circle_ratio = area_m2 / circle.geometry.area.iloc[0] if not circle.empty and circle.geometry.area.iloc[0] > 0 else 0
-    rect = property_aea.geometry.iloc[0].minimum_rotated_rectangle
-    rect_ratio = area_m2 / rect.area if rect.area > 0 else 0
+
  
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off")
@@ -472,10 +488,7 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         ["State", f"{property_gdf['state'].iloc[0]}"],
         ["Centroid", f"{lat:.4f}, {lon:.4f}"],
         ["Área", f"{area_ha:.2f} ha"],
-        ["Perímetro", f"{perimeter_m:.2f} m"],
-        ["Razão P/A", f"{pa_ratio:.4f}"],
-        ["Compacidade (Círculo)", f"{circle_ratio:.4f}"],
-        ["Compacidade (Retângulo)", f"{rect_ratio:.4f}"]
+        ["Perímetro", f"{perimeter_m:.2f} m"]
     ]
     table = ax_info.table(cellText=table_data, colLabels=["Attribute", "Value"], loc='center', cellLoc='left', colWidths=[0.3, 0.7])
     table.auto_set_font_size(False)
@@ -592,14 +605,7 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
     area_m2 = property_aea.geometry.area.iloc[0]
     area_ha = area_m2 / 10000
     perimeter_m = property_aea.geometry.length.iloc[0]
-    
-    # Métricas de Compacidade
-    pa_ratio = perimeter_m / area_m2 if area_m2 > 0 else 0
-    circle = property_gdf.minimum_bounding_circle().to_crs(brazil_aea_proj)
-    circle_ratio = area_m2 / circle.geometry.area.iloc[0] if not circle.empty and circle.geometry.area.iloc[0] > 0 else 0
-    rect = property_aea.geometry.iloc[0].minimum_rotated_rectangle
-    rect_ratio = area_m2 / rect.area if rect.area > 0 else 0
-
+     
     # --- 7. Tabela de Informações Estilizada ---
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off") # Desliga o eixo do container da tabela
@@ -611,9 +617,6 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
         ["Centroid", f"{lat:.4f}, {lon:.4f}"],
         ["Área", f"{area_ha:.2f} ha"],
         ["Perímetro", f"{perimeter_m:.2f} m"],
-        ["Razão P/A", f"{pa_ratio:.4f}"],
-        ["Compacidade (Círculo)", f"{circle_ratio:.4f}"],
-        ["Compacidade (Retângulo)", f"{rect_ratio:.4f}"]
     ]
     col_labels = ["Attribute", "Value"]
     num_rows = len(table_data)
@@ -787,7 +790,7 @@ def generate_grid_points_by_distance(geometry_4326, spacing_meters):
     return list(points_gdf_4326.geometry)
  
 import rasterio
-from rasterio.mask import mask
+from rasterio.mask import mask, geometry_mask
 from rasterio.errors import RasterioIOError
 from rasterio._err import CPLE_AppDefinedError
  
@@ -1219,8 +1222,8 @@ def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None,
     for col in df_ts.columns:
         if col != 'datetime' and pd.api.types.is_numeric_dtype(df_ts[col]):
             # O filtro requer que o window_length seja ímpar e menor que o número de pontos
-            if len(df_ts[col]) > 9:
-                df_ts[col] = savgol_filter(df_ts[col], window_length=9, polyorder=2)
+            if len(df_ts[col]) > 5:
+                df_ts[col] = savgol_filter(df_ts[col], window_length=5, polyorder=2)
 
     # Verifica se há dados para plotar
     if not df_ts.empty:
@@ -1336,7 +1339,7 @@ def plot_som_u_matrix(som, cmap='viridis_r'):
             ax.text(j, i, str(cluster_index), ha='center', va='center', color=text_colors[i, j], fontweight='bold', path_effects=path_effects)
     return fig, ax
  
-def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
+def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None, cluster_areas_ha=None):
     if ax is None:
         fig, ax = plt.subplots(figsize=(12, 6))
     else:
@@ -1346,7 +1349,10 @@ def plot_cluster_profiles(cube, predictions, band_name, cmap, ax=None):
     cluster_ids = np.unique(predictions[predictions >= 0])
     for cluster_id in cluster_ids:
         mean_series = da.where(predictions == cluster_id).mean(dim=['x', 'y'])
-        ax.plot(da['time'].values, mean_series, label=f'Cluster {cluster_id}', color=cmap(cluster_id))
+        label = f'Cluster {cluster_id}'
+        if cluster_areas_ha and cluster_id in cluster_areas_ha:
+            label += f' ({cluster_areas_ha[cluster_id]:.2f} ha)'
+        ax.plot(da['time'].values, mean_series, label=label, color=cmap(cluster_id))
     ax.set_xlabel('Time'); ax.set_ylabel(band_name); ax.legend()
     ax.set_title('Perfis Médios de NDVI por Cluster')
     return fig, ax
@@ -1490,7 +1496,17 @@ def processar_gleba(
             url=bdc_wtss_link
         )
 
-        cubo_modis = servico_wtss[colecao_modis]
+        def pega_cubo_modis(servico_wtss, colecao_modis):
+            return servico_wtss.get(colecao_modis)
+
+        cubo_modis, error = retry_request(
+            func=pega_cubo_modis,
+            name="pega o cubo do modis",
+            servico_wtss = servico_wtss,
+            colecao_modis = colecao_modis
+        )
+
+        #cubo_modis = servico_wtss[colecao_modis]
         wtss_ready = True
 
         fig_areal_ts, error = retry_request(
@@ -1558,7 +1574,7 @@ def processar_gleba(
 
                     # RGB (left)
                     if assets.get('rgb') is not None:
-                        ax_rgb.imshow(np.clip(assets['rgb'], 0, 1))
+                        ax_rgb.imshow(np.clip(assets['rgb'] / 1.5, 0, 1))
                         ax_rgb.set_title(f"{date} (RGB)")
                     else:
                         ax_rgb.text(0.5, 0.5, 'RGB Erro', ha='center', va='center')
@@ -1615,16 +1631,30 @@ def processar_gleba(
             color_list = [base_cmap(i) for i in range(num_clusters)]
             cmap = matplotlib.colors.ListedColormap(color_list, name='som_clusters')
             
+            # Calculate cluster areas
+            brazil_aea_proj = "+proj=aea +lat_0=-12 +lon_0=-54 +lat_1=-2 +lat_2=-22 +x_0=5000000 +y_0=10000000 +ellps=GRS80 +units=m +no_defs"
+            gleba_aea = gleba_geo.to_crs(brazil_aea_proj)
+            total_area_ha = gleba_aea.geometry.area.iloc[0] / 10000
+            
+            cluster_ids, pixel_counts = np.unique(predictions[predictions >= 0], return_counts=True)
+            total_pixels = np.sum(pixel_counts)
+            
+            cluster_areas_ha = {}
+            if total_pixels > 0:
+                for cluster_id, count in zip(cluster_ids, pixel_counts):
+                    percentage = (count / total_pixels)
+                    area_ha = percentage * total_area_ha
+                    cluster_areas_ha[cluster_id] = area_ha
 
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(18, 6), gridspec_kw={'width_ratios': [4, 3]})
-            plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1)
+            plot_cluster_profiles(cubo, predictions, band_name='NDVI', cmap=cmap, ax=ax1, cluster_areas_ha=cluster_areas_ha)
             plot_cluster_image(predictions, cmap, ax=ax2, show_colorbar=False)
             fig.suptitle('Análise de Clusters SOM', fontsize=16)
             plt.tight_layout(rect=[0, 0.03, 1, 0.95])
             plt.show()
 
         else:
-            print_status("   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.") 
+            print_status("   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.")
 
 
 
@@ -1864,9 +1894,9 @@ for i, dest_row in gdf.iterrows():
 
 .
 
----
-
 **Assinatura do Responsável pelo Laudo**
+
+---
 
 """
     display(Markdown(conclusion_text))
@@ -1903,68 +1933,75 @@ for i, dest_row in gdf.iterrows():
 
 \newpage
 
-## Metodologia
+## Metodologia (Atendimento à Resolução CMN Nº 5.267)
 
-Este relatório utiliza dados de sensoriamento remoto para análise e monitoramento das operações de crédito rural, combinando diferentes fontes e técnicas para gerar informações precisas sobre as propriedades financiadas.
+Este relatório utiliza dados de sensoriamento remoto para análise e monitoramento das operações de crédito rural. Esta metodologia é aplicada obrigatoriamente para as operações de custeio e investimento em áreas iguais ou superiores a **300 hectares**, conforme a Resolução CMN Nº 5.267. Combinamos diferentes fontes e técnicas para gerar informações precisas e robustas sobre as propriedades financiadas, atendendo aos requisitos de fiscalização do Banco Central (BACEN).
 
 ### Fontes de Dados de Sensoriamento Remoto
 
-- **MODIS (Moderate Resolution Imaging Spectroradiometer)**  
-  Utilizado para a geração das séries temporais médias de índices de vegetação, especialmente o NDVI (Normalized Difference Vegetation Index). Os dados MODIS possuem resolução espacial moderada (aproximadamente 250 metros) e alta frequência temporal, permitindo a análise de tendências fenológicas ao longo de vários anos (neste caso, até 6 anos). A série temporal é suavizada para reduzir ruídos e facilitar a interpretação.
+As fontes de dados foram selecionadas com base na qualidade e na necessidade de atender às resoluções **espacial, temporal, espectral e radiométrica** adequadas, conforme exigido.
 
-- **Sentinel-2**  
-  Utilizado para a geração de composições de imagens RGB e cálculo do índice EVI (Enhanced Vegetation Index) com alta resolução espacial (10 metros). As imagens Sentinel-2 são adquiridas em intervalos regulares e processadas para compor mosaicos mensais, permitindo uma análise detalhada da cobertura vegetal e condições das glebas. A máscara de nuvens é aplicada para garantir a qualidade dos dados.
+- **MODIS (Moderate Resolution Imaging Spectroradiometer)**
+  * **Resolução Espacial:** 250 metros.
+  * **Resolução Radiométrica:** 12 bits.
+  * **Utilização:** Geração de séries temporais longas (até 6 anos) do índice NDVI, permitindo a análise de tendências fenológicas e detecção de variações ao longo de amplos períodos. A série temporal é suavizada para reduzir ruídos atmosféricos e de cobertura.
+  * **Bandas Espectrais:** Infravermelho Próximo (NIR) e Vermelho (Red).
 
-### Índices de Vegetação
+- **Sentinel-2 (Missão Copernicus)**
+  * **Resolução Espacial:** 10 metros (nas bandas visíveis e NIR).
+  * **Resolução Radiométrica:** 12 bits.
+  * **Utilização:** Geração de composições de imagens RGB e cálculo do índice EVI (Enhanced Vegetation Index) com alta resolução espacial. As imagens são processadas em mosaicos mensais com aplicação rigorosa de máscara de nuvens, garantindo a qualidade e cobertura do dado.
+  * **Bandas Espectrais:**
+      * **RGB:** Bandas 4 (Red), 3 (Green) e 2 (Blue).
+      * **EVI:** Bandas 8 (NIR), 4 (Red) e 2 (Blue).
 
-- **NDVI (Normalized Difference Vegetation Index)**  
-  Índice amplamente utilizado para monitorar a saúde e vigor da vegetação, calculado a partir das bandas do vermelho e do infravermelho próximo. O NDVI é extraído das séries temporais MODIS para análise fenológica e detecção de variações ao longo do tempo.
+### Índices de Vegetação e Monitoramento
 
-- **EVI (Enhanced Vegetation Index)**  
-  Índice que melhora a sensibilidade em áreas com alta biomassa e reduz efeitos atmosféricos, calculado a partir das bandas do Sentinel-2. O EVI é utilizado para composições mensais de imagens, fornecendo uma visão detalhada da condição da vegetação nas glebas.
+- **NDVI (Normalized Difference Vegetation Index)**
+  * Utilizado para análise fenológica a partir das séries temporais MODIS, detectando variações de saúde e vigor da vegetação em escala regional.
 
-### Resoluções Espacial e Temporal
+- **EVI (Enhanced Vegetation Index)**
+  * Utilizado nas composições mensais de alta resolução (Sentinel-2) para análise detalhada da condição da vegetação nas glebas, sendo mais sensível em áreas de alta biomassa.
 
-- A resolução espacial dos dados MODIS é de aproximadamente 250 metros, adequada para análises em escala regional e séries temporais longas.  
-- As imagens Sentinel-2 possuem resolução espacial de 10 metros, permitindo análises detalhadas e precisas das propriedades rurais.  
-- Temporalmente, as séries MODIS são analisadas em intervalos mensais e anuais para capturar tendências fenológicas, enquanto as imagens Sentinel-2 são compostas mensalmente para reduzir a interferência de nuvens e melhorar a cobertura espacial.
+### Verificação de Conformidade e Procedimentos (MCR e Resolução 5.267)
 
-### Modelo de Clusterização
+O monitoramento remoto integra as análises técnicas com os requisitos regulatórios, verificando o uso adequado dos recursos e o cumprimento das normas ambientais.
 
-Para identificar padrões espaciais e temporais na dinâmica da vegetação, é aplicada a técnica de **Self-Organizing Maps (SOM)**, um método de aprendizado não supervisionado que organiza dados multidimensionais em uma grade bidimensional preservando a topologia dos dados.
+#### 1. Verificação de Área e Compatibilidade da Cultura
 
-- O SOM é treinado com as séries temporais de NDVI extraídas das imagens Sentinel-2, considerando apenas pixels válidos após aplicação de máscara de nuvens e recorte espacial.  
-- A clusterização permite agrupar áreas com comportamentos fenológicos semelhantes, facilitando a identificação de diferentes perfis de desenvolvimento vegetativo dentro das glebas.  
-- O número de clusters é definido com base na dimensão da grade SOM, e os resultados são visualizados tanto em mapas espaciais quanto em perfis temporais médios por cluster.
+* **Monitoramento da Área Emergida (MCR 2-1-3):** A alta resolução do Sentinel-2 permite o cálculo e monitoramento da **área efetivamente cultivada**, comparando-a com a área prevista na operação de crédito.
+* **Validação da Cultura:** O **Modelo de Clusterização SOM** é treinado com as séries temporais de EVI/NDVI. A análise dos **perfis temporais médios por cluster** é utilizada para **validar a fenologia da cultura financiada**, confirmando a compatibilidade da atividade em campo com o projeto aprovado.
 
-Esta abordagem integrada, combinando diferentes sensores, índices e técnicas de análise, possibilita uma avaliação robusta e detalhada das condições das propriedades rurais financiadas, apoiando a fiscalização e o monitoramento ambiental.
+#### 2. Conformidade Ambiental (MCR 2-9-5 a 16)
 
+* **Detecção de Desvio de Uso da Terra:** A combinação da série temporal de longo prazo (MODIS) com a alta resolução detalhada (Sentinel-2) é utilizada para **identificar o desmatamento ilegal ou alterações indevidas** no uso do solo.
+* **Monitoramento de Áreas Vedadas:** A metodologia permite **monitorar a manutenção da vegetação nativa e das áreas de preservação**, comparando as alterações detectadas com bases oficiais de embargos, garantindo o atendimento às regras de elegibilidade ambiental do crédito rural.
+
+### Modelo de Clusterização (Self-Organizing Maps - SOM)
+
+Para identificar padrões espaciais e temporais na dinâmica da vegetação, é aplicada a técnica **Self-Organizing Maps (SOM)**, que organiza dados multidimensionais em uma grade bidimensional, preservando a topologia.
+
+* O SOM é treinado com as séries temporais de EVI extraídas das imagens Sentinel-2, considerando apenas pixels válidos (após aplicação de máscara de nuvens e recorte espacial).
+* A clusterização agrupa áreas com comportamentos fenológicos semelhantes, facilitando a identificação de diferentes perfis de desenvolvimento vegetativo dentro das glebas para validação da cultura e detecção de anomalias.
+
+Esta abordagem integrada possibilita uma avaliação robusta e detalhada das condições das propriedades rurais, em total conformidade com as diretrizes do Banco Central para fiscalização e monitoramento.
 
 ## Glossário de Termos
 
-- **MODIS (Moderate Resolution Imaging Spectroradiometer)**: Sensor de satélite que fornece imagens com resolução espacial moderada e alta frequência temporal, utilizado para monitoramento ambiental em larga escala.
-
-- **Sentinel-2**: Satélite do programa Copernicus que fornece imagens ópticas de alta resolução espacial, utilizadas para análise detalhada da cobertura vegetal.
-
-- **NDVI (Normalized Difference Vegetation Index)**: Índice de vegetação que mede a saúde e vigor da vegetação com base na reflectância do vermelho e do infravermelho próximo.
-
-- **EVI (Enhanced Vegetation Index)**: Índice de vegetação que melhora a sensibilidade em áreas com alta biomassa e reduz interferências atmosféricas.
-
-- **Self-Organizing Map (SOM)**: Técnica de aprendizado não supervisionado que organiza dados multidimensionais em uma grade bidimensional, preservando relações topológicas para facilitar a clusterização.
-
-- **Clusterização**: Processo de agrupar dados com características semelhantes para identificar padrões ou categorias.
-
-- **Máscara de nuvens**: Técnica aplicada em imagens de satélite para identificar e excluir pixels cobertos por nuvens, garantindo a qualidade dos dados analisados.
-
-- **Gleba**: Unidade territorial delimitada dentro de uma propriedade rural, geralmente um talhão ou parcela agrícola.
-
-- **Série temporal**: Conjunto de dados coletados sequencialmente ao longo do tempo, utilizado para análise de tendências e padrões.
-
-- **Resolução espacial**: Tamanho do menor objeto que pode ser detectado em uma imagem de satélite, geralmente medido em metros.
-
-- **Resolução temporal**: Frequência com que imagens ou dados são coletados para uma mesma área.
+* **MODIS (Moderate Resolution Imaging Spectroradiometer)**: Sensor de satélite que fornece imagens com resolução espacial moderada e alta frequência temporal, utilizado para monitoramento ambiental em larga escala.
+* **Sentinel-2**: Satélite do programa Copernicus que fornece imagens ópticas de alta resolução espacial, utilizadas para análise detalhada da cobertura vegetal.
+* **NDVI (Normalized Difference Vegetation Index)**: Índice de vegetação que mede a saúde e vigor da vegetação com base na reflectância do vermelho e do infravermelho próximo.
+* **EVI (Enhanced Vegetation Index)**: Índice de vegetação que melhora a sensibilidade em áreas com alta biomassa e reduz interferências atmosféricas.
+* **Self-Organizing Map (SOM)**: Técnica de aprendizado não supervisionado que organiza dados multidimensionais em uma grade bidimensional, preservando relações topológicas para facilitar a clusterização.
+* **Clusterização**: Processo de agrupar dados com características semelhantes para identificar padrões ou categorias.
+* **Máscara de nuvens**: Técnica aplicada em imagens de satélite para identificar e excluir pixels cobertos por nuvens, garantindo a qualidade dos dados analisados.
+* **Gleba**: Unidade territorial delimitada dentro de uma propriedade rural, geralmente um talhão ou parcela agrícola.
+* **Série temporal**: Conjunto de dados coletados sequencialmente ao longo do tempo, utilizado para análise de tendências e padrões.
+* **Resolução espacial**: Tamanho do menor objeto que pode ser detectado em uma imagem de satélite, geralmente medido em metros.
+* **Resolução temporal**: Frequência com que imagens ou dados são coletados para uma mesma área.
 
 \newpage
+
 
 ## Anexos
 

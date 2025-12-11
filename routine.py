@@ -10,47 +10,56 @@ if __name__ == '__main__':
         container_name = blob_container
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
         blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
-        if blob_client.exists():
-            print(f"Blob {blob_path} already exists. Deleting it before upload.", file=sys.stderr)
-            blob_client.delete_blob()
-        try:
-            with open(local_file_path, "rb") as data:
-                blob_client.upload_blob(data, overwrite=True)
-                print(f"[Sucesso] O arquivo {local_file_path} foi upado para o blob em {container_name}/{blob_path}", file=sys.stderr)
-                if delete_original_file:
-                    os.remove(local_file_path)
-                    print(f"Arquivo local {local_file_path} deletado.", file=sys.stderr)
-        except Exception as e:
-            print(f"Falha ao upar o arquivo {local_file_path}. Erro: {e}", file=sys.stderr)
-
+        
+        for attempt in range(3):
+            try:
+                if blob_client.exists():
+                    print(f"Blob {blob_path} already exists. Deleting it before upload.", file=sys.stderr)
+                    blob_client.delete_blob()
+                
+                with open(local_file_path, "rb") as data:
+                    blob_client.upload_blob(data, overwrite=True)
+                    print(f"[Sucesso] O arquivo {local_file_path} foi upado para o blob em {container_name}/{blob_path}", file=sys.stderr)
+                    if delete_original_file:
+                        os.remove(local_file_path)
+                        print(f"Arquivo local {local_file_path} deletado.", file=sys.stderr)
+                    return  # Success, exit the function
+            except Exception as e:
+                print(f"Falha ao upar o arquivo {local_file_path} (tentativa {attempt + 1}/3). Erro: {e}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(5)
+        
+        print(f"Falha final ao upar o arquivo {local_file_path} após 3 tentativas.", file=sys.stderr)
+        sys.exit(1)
 
     ######## Função para baixar um arquivo do blob
     def baixa_file_blob(blob_container: str, blob_path: str, local_file_path: str):
-        """Downloads a file from Azure Blob Storage to the local directory.
-        Args:
-            blob_container: blob container name
-            blob_path: path of the blob in the container
-            local_file_path: local filename to write
-        """
+        """Downloads a file from Azure Blob Storage to the local directory."""
         connect_str = os.getenv(
             "AZURE_STORAGE_CONNECTION_STRING",
             "DefaultEndpointsProtocol=https;AccountName=pesquanta94c;AccountKey=MXdP1yoZ0KMzO471kyIHWHdlkxdVytpe+ExVsLbyZ9mBJcqAR5X2b3u+emLFJghYkc3Yc3ltDqHc+ASt3ACcZA==;EndpointSuffix=core.windows.net"
         )
-        container_name = blob_container
         blob_service_client = BlobServiceClient.from_connection_string(connect_str)
-        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_path)
-        if blob_client.exists():
+        blob_client = blob_service_client.get_blob_client(container=blob_container, blob=blob_path)
+
+        for attempt in range(3):
             try:
-                with open(local_file_path, "wb") as download_file:
-                    download_stream = blob_client.download_blob()
-                    download_file.write(download_stream.readall())
-                    print(f"[Sucesso] O arquivo {local_file_path} foi baixado para o diretório local", file=sys.stderr)
+                if blob_client.exists():
+                    with open(local_file_path, "wb") as download_file:
+                        download_stream = blob_client.download_blob()
+                        download_file.write(download_stream.readall())
+                        print(f"[Sucesso] O arquivo {local_file_path} foi baixado para o diretório local", file=sys.stderr)
+                        return  # Success, exit the function
+                else:
+                    print(f"[Falha] O arquivo {blob_path} não existe no blob {blob_container}", file=sys.stderr)
+                    sys.exit(1)
             except Exception as e:
-                print(f"[Falha] Erro ao baixar {blob_path}: {e}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            print(f"[Falha] O arquivo {blob_path} não existe no blob {container_name}", file=sys.stderr)
-            sys.exit(1)
+                print(f"[Falha] Erro ao baixar {blob_path} (tentativa {attempt + 1}/3). Erro: {e}", file=sys.stderr)
+                if attempt < 2:
+                    time.sleep(5)
+
+        print(f"Falha final ao baixar o arquivo {blob_path} após 3 tentativas.", file=sys.stderr)
+        sys.exit(1)
 
 
 

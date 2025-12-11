@@ -6,20 +6,20 @@ BASE_OUTPUT="azure://planetary-routines-output/MONITORAMENTO_SICOR_BACEN/"
 
 # Lista de arquivos (Array) para garantir que espaços nos nomes sejam respeitados
 files=(
-    "20250862734_Monte Alegre.xml"
-    "20241906129_ Bom Jesus.xml"
-    "20241906282_Special Fruit.xml"
-    "20241938695_Impact.xml"
-    "20241939101_Marcos Beck.xml"
-    "20241939150_Marcos Beck.xml"
-    "20250002784_ Bom Jesus.xml"
-    "20250003580_São Martinho.xml"
-    "20250003988_PS Agro.xml"
+    #"20250862734_Monte Alegre.xml"
+    #"20241906129_ Bom Jesus.xml"
+    #"20241906282_Special Fruit.xml"
+    #"20241938695_Impact.xml"
+    #"20241939101_Marcos Beck.xml"
+    #"20241939150_Marcos Beck.xml"
+    #"20250002784_ Bom Jesus.xml"
+    #"20250003580_São Martinho.xml"
+    #"20250003988_PS Agro.xml"
     "20250020768_Darci Potrich.xml"
-    "20250783561_Darci Potrich.xml"
-    "20250783755_PS Agro.xml"
+    #"20250783561_Darci Potrich.xml"
+    #"20250783755_PS Agro.xml"
     "20250784086_Horita.xml"
-    "20250786034_Agro Trojan.xml"
+    #"20250786034_Agro Trojan.xml"
 )
 
 # Loop para iterar sobre cada arquivo
