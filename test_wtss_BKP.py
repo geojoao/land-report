@@ -23,10 +23,10 @@ import shapely
 import wtss
 from shapely.geometry import Polygon, Point
 import random
+from wcpms import *
 from scipy.signal import savgol_filter
 
 from skimage.transform import resize
-from phenophase_local import extract_phenometrics_local, print_phenometrics_summary
 
 from matplotlib.backends.backend_pdf import PdfPages
 import kaleido
@@ -39,6 +39,14 @@ import requests, zipfile, io
 
 from sklearn.preprocessing import StandardScaler
 from minisom import MiniSom
+
+import pystac_client, rioxarray, xarray as xr, dask.diagnostics
+from odc.stac import stac_load
+import dask
+from rasterio.warp import reproject, Resampling
+from shapely.geometry import mapping
+from rasterio.io import MemoryFile
+from rasterio.merge import merge
 
 from collections import defaultdict
 
@@ -139,44 +147,64 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
             print_status(f"   - AVISO: Formato inválido para harvesting_period. Esperado (start, end). Erro: {e}")
 
     # --- Adiciona SOS, POS e EOS ---
-    print_status("   - Calculando métricas fenológicas (SOS, POS, EOS) com método local...")
+    print_status("   - Calculando métricas fenológicas (SOS, POS, EOS)...")
+    wcpms_url = 'https://data.inpe.br/bdc/wcpms'
+    datacube = cube_query(
+        collection='mod13q1-6.1',#"S2-16D-2",
+        start_date=start_date_pheno_str,
+        end_date=end_date_str,
+        freq="16D",
+        band="NDVI"
+    )
     
-    # Usa o método local para extrair fenometria
-    phenometrics = extract_phenometrics_local(df_ts, ndvi_column='NDVI_mean')
-    
-    # Se o método local funcionou, plota os estágios fenológicos
-    if phenometrics.get('success', False) and phenometrics['cycles']:
-        # Usa o primeiro ciclo bem-sucedido para marcar SOS, POS, EOS
-        successful_cycles = [c for c in phenometrics['cycles'] if c.get('fit_success', False)]
-        
-        if successful_cycles:
-            primary_cycle = successful_cycles[0]  # Usa o primeiro ciclo bem-sucedido
-            phenophase = primary_cycle['phenophase_dates']
-            phenophase_val = primary_cycle['phenophase_values']
-            
-            # Adiciona linhas verticais para SOS, POS e EOS
-            ax.axvline(phenophase['sos'], color='blue', linestyle='--', label='SOS (Start of Season)')
-            ax.annotate(f'SOS\n{phenophase["sos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['sos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='blue')
-            
-            ax.axvline(phenophase['pos'], color='red', linestyle='--', label='POS (Peak of Season)')
-            ax.annotate(f'POS\n{phenophase["pos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['pos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='red')
-            
-            ax.axvline(phenophase['eos'], color='purple', linestyle='--', label='EOS (End of Season)')
-            ax.annotate(f'EOS\n{phenophase["eos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['eos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='purple')
-            
-            print_status(f"   - Ciclos detectados: {phenometrics['num_cycles']}")
-            print_status(f"   - Ajustes bem-sucedidos: {phenometrics['num_successful_fits']}")
-    else:
-        print_status("   - ⚠️ Nenhum ciclo bem-sucedido detectado com método local")
+    timeseries = get_timeseries_region(
+        url=wcpms_url,
+        cube=datacube,
+        geom=gdf_to_geojson(
+            gpd.GeoDataFrame(
+                {
+                    'id': [1],
+                    'geometry': [gleba_4326]
+                },
+                crs="EPSG:4326"
+            )
+        )
+    )
+    metrics = get_phenometrics_region(
+        url=wcpms_url,
+        cube=datacube,
+        timeseries=timeseries[:350]
+    )
+
+    # Calcula a média das datas SOS, POS e EOS para todos os pixels
+    sos_dates = []
+    pos_dates = []
+    eos_dates = []
+
+    for metric in metrics:
+        phenometrics_data = metric.get('phenometrics', {})
+        if 'sos_t' in phenometrics_data:
+            sos_dates.append(pd.to_datetime(phenometrics_data['sos_t']))
+        if 'pos_t' in phenometrics_data:
+            pos_dates.append(pd.to_datetime(phenometrics_data['pos_t']))
+        if 'eos_t' in phenometrics_data:
+            eos_dates.append(pd.to_datetime(phenometrics_data['eos_t']))
+
+    # Calcula as medianas
+    med_sos_date = pd.Series(sos_dates).median() if sos_dates else None
+    med_pos_date = pd.Series(pos_dates).median() if pos_dates else None
+    med_eos_date = pd.Series(eos_dates).median() if eos_dates else None
+
+    # Adiciona linhas verticais para as medianas dos estados fenológicos
+    if med_sos_date:
+        ax.axvline(med_sos_date, color='blue', linestyle='--', label='SOS (Start of Season)')
+        ax.annotate(f'SOS\n{med_sos_date.strftime("%Y-%m-%d")}', xy=(med_sos_date, ax.get_ylim()[1]), xytext=(5, -10), textcoords='offset points', ha='left', va='top', fontsize=8, color='blue')
+    if med_pos_date:
+        ax.axvline(med_pos_date, color='red', linestyle='--', label='POS (Peak of Season)')
+        ax.annotate(f'POS\n{med_pos_date.strftime("%Y-%m-%d")}', xy=(med_pos_date, ax.get_ylim()[1]), xytext=(5, -10), textcoords='offset points', ha='left', va='top', fontsize=8, color='red')
+    if med_eos_date:
+        ax.axvline(med_eos_date, color='purple', linestyle='--', label='EOS (End of Season)')
+        ax.annotate(f'EOS\n{med_eos_date.strftime("%Y-%m-%d")}', xy=(med_eos_date, ax.get_ylim()[1]), xytext=(5, -10), textcoords='offset points', ha='left', va='top', fontsize=8, color='purple')
 
     # Ajusta a legenda para evitar duplicatas
     handles, labels = ax.get_legend_handles_labels()
@@ -206,7 +234,7 @@ if __name__ == "__main__":
     gleba_4326 = wkt.loads(wkt_input)
     
     # ID da gleba
-    gleba_id = 'teste_123'
+    gleba_id = input("Digite o ID da gleba: ")
     
     # Períodos opcionais
     planting_period = None  # Pode adicionar input se quiser

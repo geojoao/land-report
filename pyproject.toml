@@ -31,4 +31,5 @@ dependencies = [
     "azure-storage-blob",
     "tabulate",
     "update>=0.0.1",
+    "ipykernel"
 ]
