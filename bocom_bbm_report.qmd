@@ -19,8 +19,8 @@ params:
 #| tags: [parameters]
 #| include: false
 
-produtor = " Bom Jesus"
-ref_bacen = "20241906129"
+produtor = "FS Bioenergia"
+ref_bacen = "20251568641"
 ```
 
 ```{python}
@@ -388,6 +388,8 @@ def load_ibge_municipalities(bbox=None):
     """
     url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2024/Brasil/BR_Municipios_2024.zip"
     local_path = "/tmp/BR_Municipios_2024.zip"
+    #local_path = "tmp/BR_Municipios_2024.zip"
+
 
     # 1. Check if file exists locally
     if not os.path.exists(local_path):
@@ -606,7 +608,7 @@ def plot_rural_property(property_gdf, municipalities_gdf=None):
     area_ha = area_m2 / 10000
     perimeter_m = property_aea.geometry.length.iloc[0]
      
-    # --- 7. Tabela de Informações Estilizada ---
+    # --- 7. Tabela de Informações Estilizadas ---
     ax_info = fig.add_axes([0.72, 0.05, 0.25, 0.55])
     ax_info.axis("off") # Desliga o eixo do container da tabela
     
@@ -794,10 +796,10 @@ from rasterio.mask import mask, geometry_mask
 from rasterio.errors import RasterioIOError
 from rasterio._err import CPLE_AppDefinedError
  
-def retry_rasterio_open(href, max_retries=5, delay=15):
+def retry_rasterio_open(href, max_retries=10, delay=15):
     for attempt in range(max_retries):
         try:
-            with rasterio.Env(GDAL_HTTP_TIMEOUT=60, GDAL_HTTP_CONNECTTIMEOUT=20):
+            with rasterio.Env(GDAL_HTTP_TIMEOUT=60, GDAL_HTTP_CONNECTTIMEOUT=40):
                 return rasterio.open(href)
         except (RasterioIOError, CPLE_AppDefinedError) as e:
             if 'CURL' in str(e) or 'HTTP' in str(e) or 'Timeout' in str(e):
@@ -1038,117 +1040,10 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
     return merged_assets
 
 
-def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id):
+def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harvesting_period=None):
     """
     Busca e plota a série temporal média de 6 anos para a gleba inteira
-    usando a função summarize (geom=) do WTSS.
-    
-    Args:
-        gleba_4326 (shapely.geometry): A geometria da gleba em EPSG:4326.
-        gleba_id (str): O ID da gleba para o título.
-    """
-
-    print_status("   - Definindo período de 6 anos para série temporal média (WTSS)...")
-    end_date_dt = datetime.now()
-    start_date_dt = end_date_dt - relativedelta(years=10)
-    start_date_str = start_date_dt.strftime('%Y-%m-%d')
-    end_date_str = end_date_dt.strftime('%Y-%m-%d')
-    
-    print_status(f"   - Buscando série temporal sumarizada de {start_date_str} a {end_date_str}...")
-    
-    # 1. Chamar coverage.ts com a geometria (EPSG:4326)
-    # Adicionado: Verificação para geometria vazia e conversão para GeoJSON para robustez.
-    if gleba_4326.is_empty:
-        print_status("   - AVISO: A geometria da gleba está vazia. Não é possível buscar a série temporal.")
-        return None
-
-    # Simplifica a geometria para evitar URLs muito longas que causam erro 400 (Bad Request)
-    # e a converte para um dicionário GeoJSON para garantir compatibilidade.
-    #gleba_simplificada = gleba_4326.simplify(tolerance=0.0001, preserve_topology=True)
-    gleba_geojson = gleba_4326.__geo_interface__
-    timeseries = cubo.ts(
-        attributes=('NDVI',), # Fetch SCL for cloud masking
-        geom=gleba_geojson,
-        start_date=start_date_str,
-        end_date=end_date_str,
-    )
-    
-    # 2. Chamar summarize
-    print_status("   - Sumarizando dados...")
-    summarize = timeseries.summarize()
-    
-    # 3. Plotar (usando o estilo do exemplo fornecido)
-    print_status("   - Plotando gráfico da média...")
-    
-    # Define uma paleta de cores mais corporativa
-    corporate_blue = '#003366'
-    fill_color = '#e6f0f7'
-    grid_color = '#cccccc'
-    
-    fig, ax = plt.subplots(figsize=(15, 6))
-    
-    # Extrai o DataFrame com todos os pixels usando o método .df()
-    df = summarize.df()
-
-    # --- This is the conversion snippet ---
-
-    # 2. Create the new combined column name
-    # This joins 'NDVI' and 'min' to create 'NDVI_min', etc.
-    df['band_agg'] = df['attribute'] + '_' + df['aggregation']
-
-    # 3. Pivot the DataFrame
-    # - index='datetime': makes datetime the unique rows
-    # - columns='band_agg': makes the new combined names the columns
-    # - values='value': fills the grid with the corresponding values
-    wide_df = df.pivot(index='datetime', columns='band_agg', values='value')
-
-    # 4. Clean up the DataFrame (optional but recommended)
-    # 'pivot' makes 'datetime' the index. reset_index() turns it back into a column.
-    wide_df = wide_df.reset_index()
-    # Remove the index name ('band_agg') from the top of the column index
-    wide_df.columns.name = None
-
-    # --- End of conversion snippet ---
-
-    # Calcula a média de todos os pixels para cada data (linha) e cria o DataFrame final
-    df_ts = wide_df
-
-    # --- Smoothing Step ---
-    # Aplica o filtro Savitzky-Golay para suavizar a série temporal
-    # Itera sobre todas as colunas, exceto 'datetime', e aplica o filtro
-    for col in df_ts.columns:
-        if col != 'datetime' and pd.api.types.is_numeric_dtype(df_ts[col]):
-            # O filtro requer que o window_length seja ímpar e menor que o número de pontos
-            if len(df_ts[col]) > 9:
-                df_ts[col] = savgol_filter(df_ts[col], window_length=9, polyorder=2)
-
-    # Verifica se há dados para plotar
-    if not df_ts.empty:
-        # Extrai os dados de data (índice) e valor (coluna 'NDVI_mean')
-        x_data = df_ts.datetime
-        y_data = df_ts['NDVI_mean']
-        
-        # Plota a linha principal (agora suavizada) com Matplotlib
-        ax.plot(x_data, y_data, color=corporate_blue, linewidth=2.0)
-        
-        # Preenche a área sob a curva para um visual mais rico
-        ax.fill_between(x_data, y_data, color=fill_color, alpha=0.7)
-    
-    # Ajustes de estilo para um visual mais limpo e profissional
-    ax.set_title(f'Série Temporal Média de NDVI (Últimos 6 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
-    ax.set_xlabel('Data', fontsize=10)
-    ax.set_ylabel('NDVI Médio', fontsize=10)
-    ax.set_ylim(0.0, 1.0) # Forçar a escala de NDVI
-    ax.grid(axis='y', linestyle='-', alpha=0.5, color=grid_color)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    
-    return fig
-
-def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None, harvesting_period=None):
-    """
-    Busca e plota a série temporal média de 6 anos para a gleba inteira
-    usando a função summarize (geom=) do WTSS.
+    usando a função summarize (geom=) do WTSS e adiciona SOS, POS e EOS.
     
     Args:
         gleba_4326 (shapely.geometry): A geometria da gleba em EPSG:4326.
@@ -1156,18 +1051,24 @@ def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None,
         planting_period (tuple, optional): Tupla com (start_date, end_date) do plantio.
         harvesting_period (tuple, optional): Tupla com (start_date, end_date) da colheita.
     """
+    # Inicializar o cubo WTSS
+    bdc_wtss_link = 'https://data.inpe.br/bdc/wtss/v4/'
+    colecao_modis = 'mod13q1-6.1'  # Ajuste se necessário
+    servico_wtss = wtss.WTSS(bdc_wtss_link)
+    cubo = servico_wtss[colecao_modis]
 
     print_status("   - Definindo período de 6 anos para série temporal média (WTSS)...")
     end_date_dt = datetime.now()
     start_date_dt = end_date_dt - relativedelta(years=6)
     start_date_str = start_date_dt.strftime('%Y-%m-%d')
+
+    start_date_pheno_dt = end_date_dt - relativedelta(years=1)
+    start_date_pheno_str = start_date_pheno_dt.strftime('%Y-%m-%d')
     end_date_str = end_date_dt.strftime('%Y-%m-%d')
     
     print_status(f"   - Buscando série temporal sumarizada de {start_date_str} a {end_date_str}...")
 
     # Simplifica a geometria para evitar URLs muito longas que causam erro 400 (Bad Request)
-    # e a converte para um dicionário GeoJSON para garantir compatibilidade.
-    #gleba_simplificada = gleba_4326.simplify(tolerance=0.0001, preserve_topology=True)
     gleba_geojson = gleba_4326.__geo_interface__
     timeseries = cubo.ts(
         attributes=('NDVI',), # Fetch SCL for cloud masking
@@ -1194,47 +1095,23 @@ def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None,
     df = summarize.df()
 
     # --- This is the conversion snippet ---
-
-    # 2. Create the new combined column name
-    # This joins 'NDVI' and 'min' to create 'NDVI_min', etc.
     df['band_agg'] = df['attribute'] + '_' + df['aggregation']
-
-    # 3. Pivot the DataFrame
-    # - index='datetime': makes datetime the unique rows
-    # - columns='band_agg': makes the new combined names the columns
-    # - values='value': fills the grid with the corresponding values
     wide_df = df.pivot(index='datetime', columns='band_agg', values='value')
-
-    # 4. Clean up the DataFrame (optional but recommended)
-    # 'pivot' makes 'datetime' the index. reset_index() turns it back into a column.
     wide_df = wide_df.reset_index()
-    # Remove the index name ('band_agg') from the top of the column index
     wide_df.columns.name = None
-
-    # --- End of conversion snippet ---
-
-    # Calcula a média de todos os pixels para cada data (linha) e cria o DataFrame final
     df_ts = wide_df
 
     # --- Smoothing Step ---
-    # Aplica o filtro Savitzky-Golay para suavizar a série temporal
-    # Itera sobre todas as colunas, exceto 'datetime', e aplica o filtro
     for col in df_ts.columns:
         if col != 'datetime' and pd.api.types.is_numeric_dtype(df_ts[col]):
-            # O filtro requer que o window_length seja ímpar e menor que o número de pontos
             if len(df_ts[col]) > 5:
                 df_ts[col] = savgol_filter(df_ts[col], window_length=5, polyorder=2)
 
     # Verifica se há dados para plotar
     if not df_ts.empty:
-        # Extrai os dados de data (índice) e valor (coluna 'NDVI_mean')
         x_data = df_ts.datetime
         y_data = df_ts['NDVI_mean']
-        
-        # Plota a linha principal (agora suavizada) com Matplotlib
         ax.plot(x_data, y_data, color=corporate_blue, linewidth=2.0)
-        
-        # Preenche a área sob a curva para um visual mais rico
         ax.fill_between(x_data, y_data, color=fill_color, alpha=0.7)
 
     # --- Adiciona as janelas de plantio e colheita ---
@@ -1252,14 +1129,57 @@ def get_and_plot_areal_ts_wtss(cubo, gleba_4326, gleba_id, planting_period=None,
         except (TypeError, IndexError, ValueError) as e:
             print_status(f"   - AVISO: Formato inválido para harvesting_period. Esperado (start, end). Erro: {e}")
 
-    # Ajustes de estilo para um visual mais limpo e profissional
+    # --- Adiciona SOS, POS e EOS ---
+    print_status("   - Calculando métricas fenológicas (SOS, POS, EOS) com método local...")
+    
+    # Usa o método local para extrair fenometria
+    phenometrics = extract_phenometrics_local(df_ts, ndvi_column='NDVI_mean')
+    
+    # Se o método local funcionou, plota os estágios fenológicos
+    if phenometrics.get('success', False) and phenometrics['cycles']:
+        # Usa o primeiro ciclo bem-sucedido para marcar SOS, POS, EOS
+        successful_cycles = [c for c in phenometrics['cycles'] if c.get('fit_success', False)]
+        
+        if successful_cycles:
+            primary_cycle = successful_cycles[0]  # Usa o primeiro ciclo bem-sucedido
+            phenophase = primary_cycle['phenophase_dates']
+            phenophase_val = primary_cycle['phenophase_values']
+            
+            # Adiciona linhas verticais para SOS, POS e EOS
+            ax.axvline(phenophase['sos'], color='blue', linestyle='--', label='SOS (Start of Season)')
+            ax.annotate(f'SOS\n{phenophase["sos"].strftime("%Y-%m-%d")}', 
+                       xy=(phenophase['sos'], ax.get_ylim()[1]), 
+                       xytext=(5, -10), textcoords='offset points', 
+                       ha='left', va='top', fontsize=8, color='blue')
+            
+            ax.axvline(phenophase['pos'], color='red', linestyle='--', label='POS (Peak of Season)')
+            ax.annotate(f'POS\n{phenophase["pos"].strftime("%Y-%m-%d")}', 
+                       xy=(phenophase['pos'], ax.get_ylim()[1]), 
+                       xytext=(5, -10), textcoords='offset points', 
+                       ha='left', va='top', fontsize=8, color='red')
+            
+            ax.axvline(phenophase['eos'], color='purple', linestyle='--', label='EOS (End of Season)')
+            ax.annotate(f'EOS\n{phenophase["eos"].strftime("%Y-%m-%d")}', 
+                       xy=(phenophase['eos'], ax.get_ylim()[1]), 
+                       xytext=(5, -10), textcoords='offset points', 
+                       ha='left', va='top', fontsize=8, color='purple')
+            
+            print_status(f"   - Ciclos detectados: {phenometrics['num_cycles']}")
+            print_status(f"   - Ajustes bem-sucedidos: {phenometrics['num_successful_fits']}")
+    else:
+        print_status("   - ⚠️ Nenhum ciclo bem-sucedido detectado com método local")
+
+    # Ajusta a legenda para evitar duplicatas
+    handles, labels = ax.get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    ax.legend(by_label.values(), by_label.keys(), loc='upper left')
+
+    # Ajustes de estilo
     ax.set_title(f'Série Temporal Média de NDVI (Últimos 6 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
     ax.set_xlabel('Data', fontsize=10)
     ax.set_ylabel('NDVI Médio', fontsize=10)
-    ax.set_ylim(0.0, 1.0) # Forçar a escala de NDVI
-    # Adiciona a legenda para incluir as janelas de plantio/colheita, se existirem
-    if planting_period or harvesting_period:
-        ax.legend(loc='upper left')
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(loc='upper left')
     ax.grid(axis='y', linestyle='-', alpha=0.5, color=grid_color)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
@@ -1490,29 +1410,22 @@ def processar_gleba(
         # --- NOVO: Inicialização Centralizada do WTSS ---
         # Inicializa o serviço uma vez para ser usado em múltiplos passos
 
-        servico_wtss, error = retry_request(
-            func=wtss.WTSS,
-            name="conecta nos serviços WTSS",
-            url=bdc_wtss_link
-        )
-
-        def pega_cubo_modis(servico_wtss, colecao_modis):
-            return servico_wtss.get(colecao_modis)
+        def pega_cubo_modis(bdc_wtss_link, colecao_modis):
+            servico_wtss = wtss.WTSS(bdc_wtss_link)
+            return servico_wtss[colecao_modis]
 
         cubo_modis, error = retry_request(
             func=pega_cubo_modis,
             name="pega o cubo do modis",
-            servico_wtss = servico_wtss,
+            bdc_wtss_link = bdc_wtss_link,
             colecao_modis = colecao_modis
         )
 
-        #cubo_modis = servico_wtss[colecao_modis]
         wtss_ready = True
 
         fig_areal_ts, error = retry_request(
             func=get_and_plot_areal_ts_wtss,
-            name="busca da série temporal de ÁREA (WTSS Summarize)",
-            cubo=cubo_modis,
+                       name="busca da série temporal de ÁREA (WTSS Summarize)",
             gleba_4326=gleba_4326,
             gleba_id=gleba_id,
             planting_period=planting_period,
@@ -1716,13 +1629,20 @@ if 'Beneficiarios' in gdf.columns:
         cnpj_cpf = "Erro ao ler JSON de Beneficiários"
 
 # Dados cadastrais
+coerced_receita = pd.to_numeric(gdf['VlrReceitaBrutEsprdEmpnmnt'], errors='coerce')
+if coerced_receita.isna().all():
+    receita_esperada = 'N/A'
+else:
+    receita_esperada = f"{coerced_receita.fillna(0).sum():,.2f}"
+
 dados_cadastrais = {
     'Instituição Financeira:': 'BOCOM BBM',
     'Produtor:': produtor,
     'CPF / CNPJ:': cnpj_cpf,
     'REFBACEN:': ref_bacen,
-    'Área Financiada (ha):': f"{area_ha:,.2f}",
-    'Receita esperada (BRL):': f"{gdf['VlrReceitaBrutEsprdEmpnmnt'].astype(float).sum():,.2f}"
+    'Área Financiada (ha):': 'N/A' if pd.isna(area_ha) or area_ha <= 0 else f"{area_ha:,.2f}",
+    'Receita esperada (BRL):': receita_esperada,
+    'Data de Emissão:': gdf['DtEms'][0] 
 }
 
 df = pd.DataFrame(list(dados_cadastrais.items()), columns=['Atributo', 'Valor'])
@@ -1753,10 +1673,12 @@ if combined_properties_list:
     
     # Reordenar colunas para uma ordem lógica e combinar col_widths
     # As colunas são: TpPessoaPropt, CNPJBase_CPFPropt, NIRF, CodSNCR, NumRegCAR
-    df = df[['NIRF', 'CodSNCR', 'NumRegCAR']].drop_duplicates().reset_index(drop=True)
+    df = df[['NIRF', 'CodSNCR', 'NumRegCAR', 'CNPJBase_CPFPropt']].drop_duplicates().reset_index(drop=True)
     
+    df.rename(columns={'CNPJBase_CPFPropt':'CPF/CNPJ'}, inplace=True)
+
     # Ajustar col_widths para 5 colunas
-    plot_df_as_table(df, title="Imóveis Associados à Operação", col_widths=[0.15, 0.25, 0.6])
+    plot_df_as_table(df, title="Imóveis Associados à Operação", col_widths=[0.12, 0.18, 0.58, 0.18])
 else:
     display(Markdown("Nenhum imóvel associado encontrado."))
 
@@ -1767,7 +1689,7 @@ else:
 #| echo: false
 
 # Carregar o CSV de empreendimentos
-codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252')
+codempreendimento_df = pd.read_csv('https://www.bcb.gov.br/htms/sicor/Empreendimento.csv', encoding='windows-1252', sep=';', on_bad_lines='skip', engine='python')
 
 # Renomear a coluna no CSV para corresponder ao gdf
 codempreendimento_df = codempreendimento_df.rename(columns={'#CODIGO':'CodEmpnmnt'})
@@ -1826,7 +1748,8 @@ for i, dest_row in gdf.iterrows():
     display(Markdown(f"## Empreendimento {i+1}"))
 
     cols_to_exclude = ['geometry', 'Beneficiarios', 'Properties', 'Parcels', 'ZARC',
-    'IdentdEmissor', 'IdentdDestinatario', 'DomSist', 'NUOp', 'CodMsg', 'NumCtrlIF', 'CNPJEntRespons', 'DtEms', 'DtVenc', 'NumCedlCredRuralIF', 'TpInstntoCred', 'VlrTotOp', 'CodPorteBenfcrio', 'DtMovto', 'CodSistProdc', 'CD_TIPO_CULTURA',
+    'IdentdEmissor', 'IdentdDestinatario', 'DomSist', 'NUOp', 'CodMsg', 'NumCtrlIF', 'CNPJEntRespons', 'DtEms', 
+    'DtVenc', 'NumCedlCredRuralIF', 'TpInstntoCred', 'VlrTotOp', 'CodPorteBenfcrio', 'DtMovto', 'CodSistProdc', 'CD_TIPO_CULTURA',
     'DATA_INICIO','DATA_FIM','VlrParclRecProprio', 'CEDULA_MAE', 'CodProg_LinhaCred', 'TpFnteRec', 'TpEncargoFinancCompltar', 'QtdPrvProdc', 'CodModSegr', 'VlrReceitaBrutEsprdEmpnmnt', 'VARIEDADE', 'ZONEAMENTO', 'UNIDADE_MEDIDA', 'UNIDADE_MEDIDA_PREVISAO','CONSORCIO'#, 'TpSolo'
     ]
     dest_series = dest_row.drop(labels=cols_to_exclude, errors='ignore')
@@ -1856,7 +1779,19 @@ for i, dest_row in gdf.iterrows():
     cultura_emp = dest_row.get('PRODUTO', 'Não informado')
     qtd_prod_emp = dest_row.get('QtdPrvProdc', 'N/A')
 
-    produtividade = float(qtd_prod_emp)*1000 / float(area_ha_emp) if area_ha_emp > 0 else 'N/A'
+    # Calcular produtividade e produção com proteção contra 'N/A'
+    try:
+        qtd_prod_num = float(qtd_prod_emp)
+        if area_ha_emp > 0:
+            produtividade = qtd_prod_num * 1000 / area_ha_emp
+            produtividade_str = f"{produtividade:,.2f}"
+        else:
+            produtividade_str = 'N/A'
+        prod_total = qtd_prod_num * 1000
+        prod_str = f"{prod_total:,.2f}"
+    except (ValueError, TypeError):
+        produtividade_str = 'N/A'
+        prod_str = 'N/A'
     
     # Cria a tabela de desvios
     area_financiada_df_emp = pd.DataFrame([
@@ -1865,8 +1800,8 @@ for i, dest_row in gdf.iterrows():
         ["Área sem cultivo (ha):", "", "-", ""], # Valor parece estático no original
         ["Cultura:", "", cultura_emp, ""], # Valor parece estático no original
         ["Desenv. Vegetativo Alcançado:", "", "-", ""], # Valor parece estático no original
-        ["Expectativa de produtividade (Kg/ha):", "",f"{float(produtividade):,.2f}" , ""], # Valor parece estático no original
-        ["Expectativa de produção (Kg):", "", f"{float(qtd_prod_emp)*1000:,.2f}", ""]
+        ["Expectativa de produtividade (Kg/ha):", "", produtividade_str, ""], # Valor parece estático no original
+        ["Expectativa de produção (Kg):", "", prod_str, ""]
     ], columns=["Descrição", "Dados observados", "Dados informados", "Relevância"])
 
     plot_df_as_table(
