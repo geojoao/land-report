@@ -1,0 +1,659 @@
+"""
+Módulo local v2 para extração de estágios fenológicos de séries temporais de NDVI.
+Versão melhorada com melhor detecção de ciclos (safra e safrinha) usando:
+1. Suavização adaptativa da série temporal
+2. Detecção robuста de mínimos locais (solo exposto)
+3. Segmentação de ciclos independentes
+4. Fit de gaussiana em cada ciclo
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter, find_peaks, medfilt
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+import warnings
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings('ignore')
+
+
+def adaptive_smoothing(ndvi_values: np.ndarray, dates: np.ndarray, 
+                      method: str = 'savgol', target_noise_std: float = None) -> np.ndarray:
+    """
+    Aplica suavização adaptativa à série temporal.
+    
+    Args:
+        ndvi_values: Array de valores NDVI
+        dates: Array de datas (usado para calcular densidade de dados)
+        method: 'savgol', 'median', ou 'both'
+        target_noise_std: Se None, detecta automaticamente
+    
+    Returns:
+        Array suavizado
+    """
+    if len(ndvi_values) < 5:
+        return ndvi_values
+    
+    # Calcula densidade de dados (pontos por dia)
+    total_days = (dates[-1] - dates[0]) / np.timedelta64(1, 'D')
+    points_per_day = len(ndvi_values) / max(total_days, 1)
+    
+    # Define tamanho de janela adaptativo
+    if points_per_day > 0.5:  # Dados densos (diários ou próximos)
+        window = max(5, min(15, int(7 * points_per_day)))  # 5-15 dias
+    elif points_per_day > 0.1:  # Dados moderados (semanais)
+        window = max(3, min(7, int(3 * points_per_day)))
+    else:  # Dados esparsos (mensais)
+        window = max(3, min(5, int(points_per_day)))
+    
+    # Garante que é ímpar
+    window = window if window % 2 == 1 else window + 1
+    
+    smoothed = ndvi_values.copy()
+    
+    if method in ['median', 'both']:
+        # Primeira passagem: filtro mediano para remover outliers
+        smoothed = medfilt(smoothed, kernel_size=window)
+    
+    if method in ['savgol', 'both']:
+        # Segunda passagem: Savitzky-Golay para suavizar mantendo pontos de inflexão
+        polyorder = min(2, window - 2)
+        if len(smoothed) > window:
+            smoothed = savgol_filter(smoothed, window_length=window, polyorder=polyorder)
+    
+    return smoothed
+
+
+def detect_trough_peaks(ndvi_values: np.ndarray, dates: np.ndarray,
+                       method: str = 'adaptive', min_distance_days: int = 30,
+                       quantile_threshold: float = None) -> np.ndarray:
+    """
+    Detecta mínimos locais (vales) na série temporal NDVI.
+    Esses vales representam períodos de solo exposto entre ciclos.
+    Versão melhorada com maior sensibilidade e filtragem de falsos positivos.
+    
+    Args:
+        ndvi_values: Array de valores NDVI
+        dates: Array de datas
+        method: 'adaptive', 'quantile', ou 'derivative'
+        min_distance_days: Distância mínima entre vales em dias
+        quantile_threshold: Percentil para threshold automático (None = auto)
+    
+    Returns:
+        Array de índices dos mínimos locais ordenados
+    """
+    if len(ndvi_values) < 5:
+        return np.array([])
+    
+    # Converte distância em dias para índices (REDUZIDO para capturar mais ciclos)
+    total_days = (dates[-1] - dates[0]) / np.timedelta64(1, 'D')
+    min_distance_idx = max(1, int((min_distance_days * 0.5) * len(ndvi_values) / total_days))
+    
+    # Inverte a série para usar find_peaks
+    ndvi_inverted = -ndvi_values
+    
+    # Calcula estatísticas
+    ndvi_std = np.std(ndvi_values)
+    ndvi_min = np.min(ndvi_values)
+    ndvi_max = np.max(ndvi_values)
+    ndvi_mean = np.mean(ndvi_values)
+    
+    # Detecta todos os mínimos locais com baixa proeminência
+    prominence_low = max(0.01, ndvi_std * 0.15)  # Muito sensível
+    distance_param = max(1, int(min_distance_idx / 2))  # Garante mínimo de 1
+    all_troughs, all_props = find_peaks(ndvi_inverted, distance=distance_param, 
+                                        prominence=prominence_low)
+    
+    if len(all_troughs) == 0:
+        # Fallback: pega os N mínimos mais profundos
+        n_expected = max(1, int(total_days / 200))  # 1 mínimo a cada ~200 dias
+        all_troughs = np.argsort(ndvi_values)[:n_expected]
+        all_troughs = np.sort(all_troughs)
+        return all_troughs
+    
+    # FILTRA mínimos que correspondem a vales reais (solo exposto)
+    # Critério: vale deve ter NDVI significativamente mais baixo que a média
+    threshold_vale = ndvi_mean - (ndvi_std * 0.5)
+    
+    # Filtra apenas vales que descem significativamente
+    vales_filtrados = []
+    for trough_idx in all_troughs:
+        trough_value = ndvi_values[trough_idx]
+        
+        # Se o vale está abaixo do threshold, é um candidato
+        if trough_value <= threshold_vale:
+            vales_filtrados.append(trough_idx)
+        else:
+            # Mesmo que esteja acima do threshold, pode ser um vale se for local mínimo forte
+            # Verifica se é um mínimo significativo comparado aos vizinhos
+            left_idx = max(0, trough_idx - 10)
+            right_idx = min(len(ndvi_values), trough_idx + 10)
+            
+            neighbors_mean = np.mean(ndvi_values[left_idx:right_idx])
+            if trough_value < (neighbors_mean - ndvi_std * 0.2):
+                vales_filtrados.append(trough_idx)
+    
+    # Se ainda temos muitos mínimos, filtra apenas os mais profundos
+    if len(vales_filtrados) > int(total_days / 180):  # Máx 1 vale a cada ~180 dias
+        vales_filtrados = sorted(vales_filtrados, 
+                                key=lambda i: ndvi_values[i])[:int(total_days / 180)]
+        vales_filtrados = sorted(vales_filtrados)
+    
+    # Se encontrou vales filtrados, usa eles; senão usa os mínimos originais
+    if len(vales_filtrados) > 0:
+        return np.array(sorted(vales_filtrados))
+    else:
+        # Fallback para os vales mais profundos
+        deep_troughs = sorted(range(len(all_troughs)), 
+                             key=lambda i: ndvi_values[all_troughs[i]])
+        n_return = max(1, int(total_days / 200))
+        return np.array(sorted(all_troughs[deep_troughs[:n_return]]))
+
+
+def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarray,
+                  min_cycle_length_days: int = 45, extend_edges: bool = True) -> List[Dict[str, Any]]:
+    """
+    Segmenta a série temporal em ciclos independentes baseado nos vales.
+    Versão refinada para criar ciclos entre vales consecutivos.
+    
+    Args:
+        ndvi_values: Array de valores NDVI
+        dates: Array de datas
+        troughs: Índices dos vales (mínimos locais)
+        min_cycle_length_days: Comprimento mínimo do ciclo em dias
+        extend_edges: Se True, estende ciclos até as bordas da série
+    
+    Returns:
+        Lista de dicionários com informações de cada ciclo
+    """
+    cycles = []
+    
+    if len(troughs) == 0:
+        # Se não há vales, considera toda a série como um ciclo
+        cycles.append({
+            'cycle_num': 1,
+            'start_idx': 0,
+            'end_idx': len(ndvi_values) - 1,
+            'start_date': pd.Timestamp(dates[0]),
+            'end_date': pd.Timestamp(dates[-1]),
+            'length_days': (dates[-1] - dates[0]) / np.timedelta64(1, 'D'),
+            'min_ndvi': np.min(ndvi_values),
+            'max_ndvi': np.max(ndvi_values),
+        })
+        return cycles
+    
+    # Garante que troughs está ordenado e remove duplicatas
+    troughs = np.unique(troughs)
+    
+    # Filtra vales muito próximos (remove ruído)
+    total_days = (dates[-1] - dates[0]) / np.timedelta64(1, 'D')
+    min_trough_distance = max(1, int(60 * len(ndvi_values) / total_days))  # Mínimo 60 dias entre vales
+    
+    filtered_troughs = []
+    for trough in troughs:
+        if len(filtered_troughs) == 0 or (trough - filtered_troughs[-1] >= min_trough_distance):
+            filtered_troughs.append(trough)
+    
+    troughs = np.array(filtered_troughs)
+    
+    # Cada ciclo vai de um vale ao próximo vale
+    # Ciclo 0: início até trough 0
+    # Ciclo 1: trough 0 até trough 1
+    # etc.
+    
+    for i in range(len(troughs)):
+        if i == 0:
+            # Primeiro ciclo: do início até o primeiro vale
+            start_idx = 0
+            end_idx = troughs[i]
+        else:
+            # Ciclos posteriores: do vale anterior ao próximo vale
+            start_idx = troughs[i - 1]
+            end_idx = troughs[i]
+        
+        cycle_length_days = (dates[end_idx] - dates[start_idx]) / np.timedelta64(1, 'D')
+        
+        # Apenas adiciona ciclos que têm comprimento mínimo aceitável
+        if cycle_length_days >= min_cycle_length_days:
+            cycles.append({
+                'cycle_num': len(cycles) + 1,
+                'start_idx': int(start_idx),
+                'end_idx': int(end_idx),
+                'start_date': pd.Timestamp(dates[start_idx]),
+                'end_date': pd.Timestamp(dates[end_idx]),
+                'length_days': cycle_length_days,
+                'min_ndvi': np.min(ndvi_values[start_idx:end_idx + 1]),
+                'max_ndvi': np.max(ndvi_values[start_idx:end_idx + 1]),
+                'trough_idx': int(troughs[i]) if i > 0 else -1,
+                'trough_ndvi': ndvi_values[troughs[i]] if i > 0 else np.nan,
+            })
+    
+    # Adiciona ciclo final: do último vale até o fim
+    if len(troughs) > 0:
+        start_idx = troughs[-1]
+        end_idx = len(ndvi_values) - 1
+        
+        cycle_length_days = (dates[end_idx] - dates[start_idx]) / np.timedelta64(1, 'D')
+        
+        if cycle_length_days >= min_cycle_length_days:
+            cycles.append({
+                'cycle_num': len(cycles) + 1,
+                'start_idx': int(start_idx),
+                'end_idx': int(end_idx),
+                'start_date': pd.Timestamp(dates[start_idx]),
+                'end_date': pd.Timestamp(dates[end_idx]),
+                'length_days': cycle_length_days,
+                'min_ndvi': np.min(ndvi_values[start_idx:end_idx + 1]),
+                'max_ndvi': np.max(ndvi_values[start_idx:end_idx + 1]),
+                'trough_idx': int(troughs[-1]),
+                'trough_ndvi': ndvi_values[troughs[-1]],
+            })
+    
+    return cycles
+
+
+def gaussian(x: np.ndarray, amplitude: float, mean: float, std: float, offset: float) -> np.ndarray:
+    """
+    Modelo gaussiano para ajuste de dados fenológicos.
+    """
+    return amplitude * np.exp(-((x - mean) ** 2) / (2 * std ** 2)) + offset
+
+
+def fit_gaussian_to_cycle(ndvi_values: np.ndarray, dates: np.ndarray, cycle: Dict[str, Any],
+                         quality_threshold: float = 0.6) -> Dict[str, Any]:
+    """
+    Ajusta uma gaussiana a um ciclo específico e extrai parâmetros fenológicos.
+    
+    Args:
+        ndvi_values: Array completo de valores NDVI
+        dates: Array completo de datas
+        cycle: Dicionário do ciclo
+        quality_threshold: Threshold mínimo de R² para considerar fit bem-sucedido
+    
+    Returns:
+        Dicionário com parâmetros da gaussiana e estágios fenológicos
+    """
+    start_idx = cycle['start_idx']
+    end_idx = cycle['end_idx']
+    
+    # Extrai dados do ciclo
+    ndvi_cycle = ndvi_values[start_idx:end_idx + 1]
+    dates_cycle = dates[start_idx:end_idx + 1]
+    
+    # Converte datas para dias desde o início do ciclo
+    days_since_start = np.array([(d - dates_cycle[0]) / np.timedelta64(1, 'D') 
+                                 for d in dates_cycle], dtype=float)
+    
+    # Parâmetros iniciais para o ajuste
+    amplitude_init = np.max(ndvi_cycle) - np.min(ndvi_cycle)
+    mean_init = days_since_start[np.argmax(ndvi_cycle)]
+    std_init = (days_since_start[-1] - days_since_start[0]) / 4
+    offset_init = np.min(ndvi_cycle)
+    
+    initial_guess = [amplitude_init, mean_init, std_init, offset_init]
+    
+    # Define limites para o ajuste
+    lower_bounds = [0.01, days_since_start[0], 5, -0.5]
+    upper_bounds = [1.0, days_since_start[-1], (days_since_start[-1] - days_since_start[0]) / 1.5, 
+                   np.max(ndvi_cycle)]
+    
+    try:
+        # Ajusta a gaussiana
+        popt, pcov = curve_fit(
+            gaussian, 
+            days_since_start, 
+            ndvi_cycle,
+            p0=initial_guess,
+            bounds=(lower_bounds, upper_bounds),
+            maxfev=10000,
+            method='trf'
+        )
+        
+        amplitude, mean_pos, std_dev, offset = popt
+        
+        # Valida parâmetros (evita gaussianas invertidas ou degeneradas)
+        if amplitude < 0.01 or std_dev < 2:
+            return {
+                'fit_success': False,
+                'reason': 'Parâmetros degenerados',
+                'cycle': cycle
+            }
+        
+        # Calcula qualidade do ajuste (R²)
+        residuals = ndvi_cycle - gaussian(days_since_start, *popt)
+        ss_res = np.sum(residuals ** 2)
+        ss_tot = np.sum((ndvi_cycle - np.mean(ndvi_cycle)) ** 2)
+        r_squared = 1 - (ss_res / (ss_tot + 1e-8))
+        
+        # Verifica qualidade mínima
+        if r_squared < quality_threshold:
+            return {
+                'fit_success': False,
+                'reason': f'R² baixo: {r_squared:.3f}',
+                'r_squared': r_squared,
+                'cycle': cycle
+            }
+        
+        # Extrai pontos fenológicos (SOS, POS, EOS)
+        # SOS/EOS: ponto onde gaussiana atinge 25% da amplitude
+        amplitude_25pct = 0.25
+        x_offset = np.sqrt(-2 * std_dev ** 2 * np.log(amplitude_25pct))
+        
+        sos_days = max(mean_pos - x_offset, days_since_start[0])
+        eos_days = min(mean_pos + x_offset, days_since_start[-1])
+        
+        # Converte para datas reais
+        sos_date = pd.Timestamp(dates_cycle[0]) + timedelta(days=float(sos_days))
+        pos_date = pd.Timestamp(dates_cycle[0]) + timedelta(days=float(mean_pos))
+        eos_date = pd.Timestamp(dates_cycle[0]) + timedelta(days=float(eos_days))
+        
+        # Calcula valores de NDVI em pontos fenológicos
+        sos_ndvi = gaussian(sos_days, *popt)
+        pos_ndvi = gaussian(mean_pos, *popt)
+        eos_ndvi = gaussian(eos_days, *popt)
+        
+        return {
+            'fit_success': True,
+            'cycle_num': cycle['cycle_num'],
+            'cycle_start': cycle['start_date'],
+            'cycle_end': cycle['end_date'],
+            'cycle_length_days': cycle['length_days'],
+            'r_squared': float(r_squared),
+            'rmse': float(np.sqrt(np.mean(residuals ** 2))),
+            'gaussian_params': {
+                'amplitude': float(amplitude),
+                'mean_days': float(mean_pos),
+                'std_dev_days': float(std_dev),
+                'offset': float(offset)
+            },
+            'phenophase_dates': {
+                'sos': sos_date,
+                'pos': pos_date,
+                'eos': eos_date
+            },
+            'phenophase_values': {
+                'sos_ndvi': float(sos_ndvi),
+                'pos_ndvi': float(pos_ndvi),
+                'eos_ndvi': float(eos_ndvi)
+            },
+            'phenophase_days': {
+                'sos_days': float(sos_days),
+                'pos_days': float(mean_pos),
+                'eos_days': float(eos_days)
+            }
+        }
+    
+    except Exception as e:
+        return {
+            'fit_success': False,
+            'reason': f'Erro na otimização: {str(e)}',
+            'cycle': cycle
+        }
+
+
+def extract_phenometrics(df_ts: pd.DataFrame, ndvi_column: str = 'NDVI_mean',
+                           min_cycle_length_days: int = 45,
+                           smoothing_method: str = 'savgol',
+                           quality_threshold: float = 0.6,
+                           quantile_trough: float = 20) -> Dict[str, Any]:
+    """
+    Extrai métricas fenológicas completas usando nova metodologia v2.
+    Otimizada para detectar múltiplas safras (safra e safrinha).
+    
+    Args:
+        df_ts: DataFrame com série temporal (deve ter 'datetime' e coluna NDVI)
+        ndvi_column: Nome da coluna NDVI
+        min_cycle_length_days: Comprimento mínimo do ciclo em dias
+        smoothing_method: 'savgol', 'median', ou 'both'
+        quality_threshold: Threshold mínimo de R² para fit bem-sucedido
+        quantile_trough: Percentil para detectar vales (mais baixo = mais sensível)
+    
+    Returns:
+        Dicionário com métricas fenológicas e ciclos ajustados
+    """
+    # Preparação dos dados
+    df_ts = df_ts.copy()
+    df_ts['datetime'] = pd.to_datetime(df_ts['datetime'])
+    df_ts = df_ts.sort_values('datetime')
+    
+    ndvi_values = df_ts[ndvi_column].values.astype(float)
+    dates = df_ts['datetime'].values
+    
+    # Valida dados
+    if len(ndvi_values) < 10:
+        return {
+            'success': False,
+            'error': 'Série temporal muito curta (< 10 pontos)',
+            'cycles': []
+        }
+    
+    # Remove NaNs
+    valid_mask = ~np.isnan(ndvi_values)
+    ndvi_values = ndvi_values[valid_mask]
+    dates = dates[valid_mask]
+    
+    if len(ndvi_values) < 10:
+        return {
+            'success': False,
+            'error': 'Série temporal muito curta após remover NaNs',
+            'cycles': []
+        }
+    
+    # Etapa 1: Suavização adaptativa
+    ndvi_smooth = adaptive_smoothing(ndvi_values, dates, method=smoothing_method)
+    
+    # Etapa 2: Detecção de vales (mínimos locais)
+    troughs = detect_trough_peaks(ndvi_smooth, dates, method='adaptive', 
+                                 min_distance_days=int(min_cycle_length_days * 0.7),
+                                 quantile_threshold=quantile_trough)
+    
+    # Etapa 3: Segmentação de ciclos
+    cycles = segment_cycles(ndvi_values, dates, troughs, 
+                           min_cycle_length_days=min_cycle_length_days)
+    
+    # Etapa 4: Fit de gaussiana em cada ciclo
+    fitted_cycles = []
+    for cycle in cycles:
+        result = fit_gaussian_to_cycle(ndvi_values, dates, cycle, 
+                                      quality_threshold=quality_threshold)
+        fitted_cycles.append(result)
+    
+    # Extrai estatísticas
+    successful_cycles = [c for c in fitted_cycles if c.get('fit_success', False)]
+    failed_cycles = [c for c in fitted_cycles if not c.get('fit_success', False)]
+    
+    if successful_cycles:
+        mean_r_squared = np.mean([c['r_squared'] for c in successful_cycles])
+        mean_cycle_length = np.mean([c['cycle_length_days'] for c in successful_cycles])
+        mean_rmse = np.mean([c['rmse'] for c in successful_cycles])
+    else:
+        mean_r_squared = 0.0
+        mean_cycle_length = 0.0
+        mean_rmse = 0.0
+    
+    return {
+        'success': True,
+        'num_cycles_detected': len(cycles),
+        'num_successful_fits': len(successful_cycles),
+        'num_failed_fits': len(failed_cycles),
+        'mean_r_squared': float(mean_r_squared),
+        'mean_rmse': float(mean_rmse),
+        'mean_cycle_length_days': float(mean_cycle_length),
+        'data_points': len(ndvi_values),
+        'total_days': float((dates[-1] - dates[0]) / np.timedelta64(1, 'D')),
+        'cycles': fitted_cycles,
+        'diagnostics': {
+            'ndvi_min': float(np.min(ndvi_values)),
+            'ndvi_max': float(np.max(ndvi_values)),
+            'ndvi_mean': float(np.mean(ndvi_values)),
+            'ndvi_std': float(np.std(ndvi_values)),
+            'num_troughs': len(troughs),
+            'troughs_indices': troughs.tolist() if len(troughs) > 0 else [],
+        }
+    }
+
+
+def print_phenometrics_summary(phenometrics: Dict) -> None:
+    """
+    Imprime um resumo dos resultados das métricas fenológicas v2.
+    """
+    print("\n" + "="*80)
+    print("RESUMO DE MÉTRICAS FENOLÓGICAS (MÉTODO V2)")
+    print("="*80)
+    
+    if not phenometrics.get('success', False):
+        print(f"❌ Erro: {phenometrics.get('error', 'Desconhecido')}")
+        return
+    
+    print(f"\n📊 ESTATÍSTICAS GERAIS:")
+    print(f"   Ciclos detectados: {phenometrics['num_cycles_detected']}")
+    print(f"   Ajustes bem-sucedidos: {phenometrics['num_successful_fits']}")
+    print(f"   Ajustes falhados: {phenometrics['num_failed_fits']}")
+    print(f"   Pontos de dados: {phenometrics['data_points']}")
+    print(f"   Duração total: {phenometrics['total_days']:.1f} dias")
+    
+    print(f"\n📈 QUALIDADE DO AJUSTE:")
+    print(f"   R² médio: {phenometrics['mean_r_squared']:.4f}")
+    print(f"   RMSE médio: {phenometrics['mean_rmse']:.4f}")
+    print(f"   Comprimento médio do ciclo: {phenometrics['mean_cycle_length_days']:.1f} dias")
+    
+    print(f"\n🌾 DADOS NDVI:")
+    diag = phenometrics['diagnostics']
+    print(f"   Mínimo: {diag['ndvi_min']:.4f}")
+    print(f"   Máximo: {diag['ndvi_max']:.4f}")
+    print(f"   Média: {diag['ndvi_mean']:.4f}")
+    print(f"   Desvio padrão: {diag['ndvi_std']:.4f}")
+    print(f"   Vales detectados: {diag['num_troughs']}")
+    
+    print("\n" + "-"*80)
+    print("DETALHES DE CADA CICLO:")
+    print("-"*80)
+    
+    for cycle in phenometrics['cycles']:
+        if cycle['fit_success']:
+            print(f"\n✅ Ciclo {cycle['cycle_num']}:")
+            print(f"   Período: {cycle['cycle_start'].strftime('%Y-%m-%d')} a {cycle['cycle_end'].strftime('%Y-%m-%d')}")
+            print(f"   Duração: {cycle['cycle_length_days']:.1f} dias")
+            print(f"   R²: {cycle['r_squared']:.4f}")
+            print(f"   RMSE: {cycle['rmse']:.4f}")
+            print(f"   SOS: {cycle['phenophase_dates']['sos'].strftime('%Y-%m-%d')} (NDVI: {cycle['phenophase_values']['sos_ndvi']:.4f})")
+            print(f"   POS: {cycle['phenophase_dates']['pos'].strftime('%Y-%m-%d')} (NDVI: {cycle['phenophase_values']['pos_ndvi']:.4f})")
+            print(f"   EOS: {cycle['phenophase_dates']['eos'].strftime('%Y-%m-%d')} (NDVI: {cycle['phenophase_values']['eos_ndvi']:.4f})")
+        else:
+            print(f"\n❌ Ciclo {cycle['cycle_num']}: Falha no ajuste")
+            print(f"   Motivo: {cycle['reason']}")
+    
+    print("\n" + "="*80 + "\n")
+
+
+def plot_diagnostic(df_ts: pd.DataFrame, phenometrics: Dict, ndvi_column: str = 'NDVI_mean',
+                       title: str = 'Diagnóstico de Detecção de Safras (V2)') -> plt.Figure:
+    """
+    Plota diagnóstico completo da detecção de ciclos.
+    """
+    df_ts = df_ts.copy()
+    df_ts['datetime'] = pd.to_datetime(df_ts['datetime'])
+    df_ts = df_ts.sort_values('datetime')
+    
+    ndvi_values = df_ts[ndvi_column].values
+    dates = df_ts['datetime'].values
+    
+    # Suavização para visualização
+    if len(ndvi_values) > 11:
+        ndvi_smooth = savgol_filter(ndvi_values, window_length=11, polyorder=2)
+    else:
+        ndvi_smooth = ndvi_values
+    
+    fig, axes = plt.subplots(3, 1, figsize=(16, 12))
+    
+    # Gráfico 1: NDVI bruto vs suavizado
+    ax = axes[0]
+    ax.plot(dates, ndvi_values, 'k-', linewidth=1, alpha=0.5, label='NDVI Original')
+    ax.plot(dates, ndvi_smooth, 'b-', linewidth=2, label='NDVI Suavizado')
+    
+    # Marca vales detectados
+    troughs = phenometrics['diagnostics']['troughs_indices']
+    if len(troughs) > 0:
+        ax.scatter(dates[troughs], ndvi_values[troughs], color='red', s=100, 
+                  marker='v', label='Vales Detectados', zorder=5)
+    
+    ax.set_ylabel('NDVI', fontsize=11)
+    ax.set_title(f'{title} - NDVI Original vs Suavizado', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right')
+    
+    # Gráfico 2: Ciclos com cores
+    ax = axes[1]
+    ax.plot(dates, ndvi_values, 'k-', linewidth=0.8, alpha=0.3, label='NDVI Original')
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, max(5, len(phenometrics['cycles']))))
+    
+    for i, cycle in enumerate(phenometrics['cycles']):
+        if cycle['fit_success']:
+            start_idx = phenometrics['cycles'].index(cycle)  # Posição aproximada
+            color = colors[i % len(colors)]
+            
+            # Extrai dados do ciclo
+            cycle_start = cycle['cycle_start']
+            cycle_end = cycle['cycle_end']
+            
+            # Marca período do ciclo
+            ax.axvspan(cycle_start, cycle_end, alpha=0.1, color=color)
+            
+            # Marca pontos fenológicos
+            ax.scatter([cycle['phenophase_dates']['sos']], 
+                      [cycle['phenophase_values']['sos_ndvi']], 
+                      marker='o', s=80, color=color, edgecolors='black', linewidth=1.5)
+            ax.scatter([cycle['phenophase_dates']['pos']], 
+                      [cycle['phenophase_values']['pos_ndvi']], 
+                      marker='*', s=300, color=color, edgecolors='black', linewidth=1.5)
+            ax.scatter([cycle['phenophase_dates']['eos']], 
+                      [cycle['phenophase_values']['eos_ndvi']], 
+                      marker='s', s=80, color=color, edgecolors='black', linewidth=1.5)
+    
+    ax.set_ylabel('NDVI', fontsize=11)
+    ax.set_title('Ciclos Detectados com Pontos Fenológicos', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(['NDVI Original'] + [f'Ciclo {c["cycle_num"]}' for c in phenometrics['cycles'] 
+                                   if c['fit_success']], loc='upper right')
+    
+    # Gráfico 3: Fit de gaussiana
+    ax = axes[2]
+    ax.plot(dates, ndvi_values, 'k-', linewidth=1.5, label='NDVI Original', zorder=1)
+    
+    for i, cycle in enumerate(phenometrics['cycles']):
+        if cycle['fit_success']:
+            color = colors[i % len(colors)]
+            
+            # Reconstrói a gaussiana
+            cycle_start_date = cycle['cycle_start']
+            cycle_end_date = cycle['cycle_end']
+            
+            # Cria série de dias para plotar gaussiana
+            cycle_dates_mask = (dates >= cycle_start_date) & (dates <= cycle_end_date)
+            cycle_dates = dates[cycle_dates_mask]
+            
+            if len(cycle_dates) > 0:
+                days_since_start = np.array([(d - cycle_dates[0]) / np.timedelta64(1, 'D') 
+                                            for d in cycle_dates], dtype=float)
+                
+                params = cycle['gaussian_params']
+                gaussian_vals = gaussian(days_since_start, 
+                                       params['amplitude'],
+                                       params['mean_days'],
+                                       params['std_dev_days'],
+                                       params['offset'])
+                
+                ax.plot(cycle_dates, gaussian_vals, '--', linewidth=2.5, 
+                       color=color, label=f'Ciclo {cycle["cycle_num"]} (R²={cycle["r_squared"]:.3f})')
+    
+    ax.set_xlabel('Data', fontsize=11)
+    ax.set_ylabel('NDVI', fontsize=11)
+    ax.set_title('Ajustes Gaussianos por Ciclo', fontsize=13, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='upper right', fontsize=9)
+    
+    plt.tight_layout()
+    return fig

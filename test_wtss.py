@@ -26,7 +26,7 @@ import random
 from scipy.signal import savgol_filter
 
 from skimage.transform import resize
-from phenophase_local import extract_phenometrics_local, print_phenometrics_summary
+from phenophase import extract_phenometrics, print_phenometrics_summary, plot_diagnostic
 
 from matplotlib.backends.backend_pdf import PdfPages
 import kaleido
@@ -139,44 +139,48 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
             print_status(f"   - AVISO: Formato inválido para harvesting_period. Esperado (start, end). Erro: {e}")
 
     # --- Adiciona SOS, POS e EOS ---
-    print_status("   - Calculando métricas fenológicas (SOS, POS, EOS) com método local...")
+    print_status("   - Calculando métricas fenológicas (SOS, POS, EOS) com método V2...")
     
-    # Usa o método local para extrair fenometria
-    phenometrics = extract_phenometrics_local(df_ts, ndvi_column='NDVI_mean')
+    # Usa o novo método v2 para extrair fenometria
+    # Otimizado para detectar múltiplas safras (safra e safrinha)
+    phenometrics = extract_phenometrics(
+        df_ts, 
+        ndvi_column='NDVI_mean',
+        min_cycle_length_days=45,  # Reduzido para capturar safrinhas mais curtas
+        quality_threshold=0.55,     # Mais permissivo
+        smoothing_method='both',    # Combina median + savgol
+        quantile_trough=25          # Mais sensível
+    )
     
-    # Se o método local funcionou, plota os estágios fenológicos
+    # Se o método v2 funcionou, plota os estágios fenológicos
     if phenometrics.get('success', False) and phenometrics['cycles']:
-        # Usa o primeiro ciclo bem-sucedido para marcar SOS, POS, EOS
+        # Plota TODOS os ciclos bem-sucedidos
         successful_cycles = [c for c in phenometrics['cycles'] if c.get('fit_success', False)]
         
         if successful_cycles:
-            primary_cycle = successful_cycles[0]  # Usa o primeiro ciclo bem-sucedido
-            phenophase = primary_cycle['phenophase_dates']
-            phenophase_val = primary_cycle['phenophase_values']
+            colors_cycle = ['blue', 'red', 'purple', 'green', 'orange', 'brown']
             
-            # Adiciona linhas verticais para SOS, POS e EOS
-            ax.axvline(phenophase['sos'], color='blue', linestyle='--', label='SOS (Start of Season)')
-            ax.annotate(f'SOS\n{phenophase["sos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['sos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='blue')
+            for idx, cycle in enumerate(successful_cycles):
+                color_base = colors_cycle[idx % len(colors_cycle)]
+                phenophase = cycle['phenophase_dates']
+                
+                # Adiciona linhas verticais para SOS, POS e EOS
+                ax.axvline(phenophase['sos'], color=color_base, linestyle='--', alpha=0.6, linewidth=1.5)
+                ax.axvline(phenophase['pos'], color=color_base, linestyle='-', alpha=0.7, linewidth=2)
+                ax.axvline(phenophase['eos'], color=color_base, linestyle='--', alpha=0.6, linewidth=1.5)
+                
+                # Anotações para primeiros ciclos
+                if idx < 2:
+                    ax.annotate(f'C{idx+1}', 
+                               xy=(phenophase['pos'], ax.get_ylim()[1] * 0.85), 
+                               xytext=(0, -5), textcoords='offset points', 
+                               ha='center', va='top', fontsize=8, color=color_base, fontweight='bold')
             
-            ax.axvline(phenophase['pos'], color='red', linestyle='--', label='POS (Peak of Season)')
-            ax.annotate(f'POS\n{phenophase["pos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['pos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='red')
-            
-            ax.axvline(phenophase['eos'], color='purple', linestyle='--', label='EOS (End of Season)')
-            ax.annotate(f'EOS\n{phenophase["eos"].strftime("%Y-%m-%d")}', 
-                       xy=(phenophase['eos'], ax.get_ylim()[1]), 
-                       xytext=(5, -10), textcoords='offset points', 
-                       ha='left', va='top', fontsize=8, color='purple')
-            
-            print_status(f"   - Ciclos detectados: {phenometrics['num_cycles']}")
+            print_status(f"   - Ciclos detectados: {phenometrics['num_cycles_detected']}")
             print_status(f"   - Ajustes bem-sucedidos: {phenometrics['num_successful_fits']}")
+            print_status(f"   - R² médio: {phenometrics['mean_r_squared']:.4f}")
     else:
-        print_status("   - ⚠️ Nenhum ciclo bem-sucedido detectado com método local")
+        print_status("   - ⚠️ Nenhum ciclo bem-sucedido detectado com método V2")
 
     # Ajusta a legenda para evitar duplicatas
     handles, labels = ax.get_legend_handles_labels()
