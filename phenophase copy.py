@@ -73,7 +73,6 @@ def detect_trough_peaks(ndvi_values: np.ndarray, dates: np.ndarray,
     Detecta mínimos locais (vales) na série temporal NDVI.
     Esses vales representam períodos de solo exposto entre ciclos.
     Versão melhorada com maior sensibilidade e filtragem de falsos positivos.
-    AGORA COM MELHOR SUPORTE PARA SAFRA/SAFRINHA (dupla safra).
     
     Args:
         ndvi_values: Array de valores NDVI
@@ -88,9 +87,9 @@ def detect_trough_peaks(ndvi_values: np.ndarray, dates: np.ndarray,
     if len(ndvi_values) < 5:
         return np.array([])
     
-    # Converte distância em dias para índices
+    # Converte distância em dias para índices (REDUZIDO para capturar mais ciclos)
     total_days = (dates[-1] - dates[0]) / np.timedelta64(1, 'D')
-    min_distance_idx = max(1, int((min_distance_days * 0.4) * len(ndvi_values) / total_days))  # REDUZIDO para detectar ciclos curtos
+    min_distance_idx = max(1, int((min_distance_days * 0.5) * len(ndvi_values) / total_days))
     
     # Inverte a série para usar find_peaks
     ndvi_inverted = -ndvi_values
@@ -100,94 +99,57 @@ def detect_trough_peaks(ndvi_values: np.ndarray, dates: np.ndarray,
     ndvi_min = np.min(ndvi_values)
     ndvi_max = np.max(ndvi_values)
     ndvi_mean = np.mean(ndvi_values)
-    ndvi_range = ndvi_max - ndvi_min
     
-    # ESTRATÉGIA MELHORADA: Múltiplos níveis de detecção para capturar safra/safrinha
-    
-    # Nível 1: Detecção muito sensível (vales profundos e superficiais)
-    prominence_very_low = max(0.008, ndvi_std * 0.08)  # MUITO sensível para pegar tudo
-    distance_very_loose = max(1, int(min_distance_idx * 0.4))  # Permite vales próximos
-    
-    all_troughs, all_props = find_peaks(ndvi_inverted, distance=distance_very_loose, 
-                                        prominence=prominence_very_low)
+    # Detecta todos os mínimos locais com baixa proeminência
+    prominence_low = max(0.01, ndvi_std * 0.15)  # Muito sensível
+    distance_param = max(1, int(min_distance_idx / 2))  # Garante mínimo de 1
+    all_troughs, all_props = find_peaks(ndvi_inverted, distance=distance_param, 
+                                        prominence=prominence_low)
     
     if len(all_troughs) == 0:
         # Fallback: pega os N mínimos mais profundos
-        n_expected = max(2, int(total_days / 150))  # Espera mais ciclos (1 a cada ~150 dias para safra+safrinha)
+        n_expected = max(1, int(total_days / 200))  # 1 mínimo a cada ~200 dias
         all_troughs = np.argsort(ndvi_values)[:n_expected]
         all_troughs = np.sort(all_troughs)
         return all_troughs
     
-    # FILTRAGEM INTELIGENTE: Separa vales reais de ruído
-    # Vales reais devem cumprir UM desses critérios:
-    # 1. Estar abaixo de um threshold de solo exposto
-    # 2. Ser um mínimo LOCAL significativo (comparado aos vizinhos imediatos)
-    # 3. Marcar transição clara entre ciclos (mudança abrupta na derivada)
+    # FILTRA mínimos que correspondem a vales reais (solo exposto)
+    # Critério: vale deve ter NDVI significativamente mais baixo que a média
+    threshold_vale = ndvi_mean - (ndvi_std * 0.5)
     
-    threshold_solo_exposto = ndvi_mean - (ndvi_std * 0.6)
-    threshold_minimo_local = ndvi_mean - (ndvi_std * 0.3)
-    
-    vales_classificados = []
-    
+    # Filtra apenas vales que descem significativamente
+    vales_filtrados = []
     for trough_idx in all_troughs:
         trough_value = ndvi_values[trough_idx]
-        score = 0
         
-        # Critério 1: Solo exposto (muito baixo)
-        if trough_value <= threshold_solo_exposto:
-            score += 3
-        elif trough_value <= threshold_minimo_local:
-            score += 2
-        
-        # Critério 2: Mínimo local significativo (comparado aos vizinhos)
-        window_size = max(2, int(min_distance_idx * 0.3))  # Janela adaptativa
-        left_idx = max(0, trough_idx - window_size)
-        right_idx = min(len(ndvi_values), trough_idx + window_size)
-        
-        neighbors = ndvi_values[left_idx:right_idx]
-        neighbors_min = np.min(neighbors)
-        neighbors_mean = np.mean(neighbors)
-        
-        # Se for o mínimo local ou bem perto dele, é um bom candidato
-        if abs(trough_value - neighbors_min) < 0.01 and trough_value < (neighbors_mean - ndvi_std * 0.15):
-            score += 2
-        
-        # Critério 3: Detecta "knees" - mudanças abruptas em NDVI (entre ciclos)
-        if trough_idx > 2 and trough_idx < len(ndvi_values) - 2:
-            derivative_before = ndvi_values[trough_idx] - np.mean(ndvi_values[max(0, trough_idx-3):trough_idx])
-            derivative_after = np.mean(ndvi_values[trough_idx+1:min(len(ndvi_values), trough_idx+4)]) - ndvi_values[trough_idx]
+        # Se o vale está abaixo do threshold, é um candidato
+        if trough_value <= threshold_vale:
+            vales_filtrados.append(trough_idx)
+        else:
+            # Mesmo que esteja acima do threshold, pode ser um vale se for local mínimo forte
+            # Verifica se é um mínimo significativo comparado aos vizinhos
+            left_idx = max(0, trough_idx - 10)
+            right_idx = min(len(ndvi_values), trough_idx + 10)
             
-            # Se há mudança abrupta (típico de transição entre ciclos)
-            if abs(derivative_before) > ndvi_std * 0.15 or abs(derivative_after) > ndvi_std * 0.15:
-                score += 1
-        
-        # Guarda vales com score >= 2 ou que são obviamente baixos
-        if score >= 2 or trough_value < threshold_minimo_local:
-            vales_classificados.append((trough_idx, score, trough_value))
+            neighbors_mean = np.mean(ndvi_values[left_idx:right_idx])
+            if trough_value < (neighbors_mean - ndvi_std * 0.2):
+                vales_filtrados.append(trough_idx)
     
-    # Ordena por score para priorizar vales reais
-    vales_classificados.sort(key=lambda x: (-x[1], x[2]))  # Maior score, menor NDVI
+    # Se ainda temos muitos mínimos, filtra apenas os mais profundos
+    if len(vales_filtrados) > int(total_days / 180):  # Máx 1 vale a cada ~180 dias
+        vales_filtrados = sorted(vales_filtrados, 
+                                key=lambda i: ndvi_values[i])[:int(total_days / 180)]
+        vales_filtrados = sorted(vales_filtrados)
     
-    # Reduz para número razoável se houver muitos candidatos
-    # Permite mais ciclos para detectar safra/safrinha
-    max_vales = max(3, int(total_days / 120))  # 1 vale a cada ~120 dias (permite 2 safras por ano)
-    vales_filtrados = [v[0] for v in vales_classificados[:max_vales]]
-    
+    # Se encontrou vales filtrados, usa eles; senão usa os mínimos originais
     if len(vales_filtrados) > 0:
-        # Ordena temporalmente
-        vales_filtrados = np.array(sorted(vales_filtrados))
-        
-        # Remove vales duplicados/muito próximos (< 40 dias)
-        min_trough_dist_strong = max(1, int(40 * len(ndvi_values) / total_days))
-        final_vales = []
-        for v in vales_filtrados:
-            if len(final_vales) == 0 or v - final_vales[-1] >= min_trough_dist_strong:
-                final_vales.append(v)
-        
-        return np.array(final_vales)
+        return np.array(sorted(vales_filtrados))
     else:
-        # Fallback: os vales mais profundos
-        return np.array(sorted([v[0] for v in vales_classificados[:max(2, int(total_days / 200))]]))
+        # Fallback para os vales mais profundos
+        deep_troughs = sorted(range(len(all_troughs)), 
+                             key=lambda i: ndvi_values[all_troughs[i]])
+        n_return = max(1, int(total_days / 200))
+        return np.array(sorted(all_troughs[deep_troughs[:n_return]]))
 
 
 def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarray,
@@ -195,7 +157,6 @@ def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarr
     """
     Segmenta a série temporal em ciclos independentes baseado nos vales.
     Versão refinada para criar ciclos entre vales consecutivos.
-    MELHORADA para detectar safra/safrinha com ciclos curtos e adjacentes.
     
     Args:
         ndvi_values: Array de valores NDVI
@@ -226,10 +187,9 @@ def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarr
     # Garante que troughs está ordenado e remove duplicatas
     troughs = np.unique(troughs)
     
-    # Filtra vales muito próximos (remove ruído), MAS PERMITE DISTÂNCIAS MENORES para safra/safrinha
+    # Filtra vales muito próximos (remove ruído)
     total_days = (dates[-1] - dates[0]) / np.timedelta64(1, 'D')
-    # Reduzido de 60 dias para 35 dias para permitir safra/safrinha (ciclos curtos)
-    min_trough_distance = max(1, int(35 * len(ndvi_values) / total_days))
+    min_trough_distance = max(1, int(60 * len(ndvi_values) / total_days))  # Mínimo 60 dias entre vales
     
     filtered_troughs = []
     for trough in troughs:
@@ -238,19 +198,24 @@ def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarr
     
     troughs = np.array(filtered_troughs)
     
-    # Estratégia melhorada de segmentação para safra/safrinha
-    # Agora cria ciclos de forma mais inteligente:
-    # - Ciclo inicial: do início até primeiro vale
-    # - Ciclos intermediários: cada um começa onde o anterior termina
-    # - Ciclo final: do último vale até o fim
+    # Cada ciclo vai de um vale ao próximo vale
+    # Ciclo 0: início até trough 0
+    # Ciclo 1: trough 0 até trough 1
+    # etc.
     
-    # Ciclo inicial
-    if len(troughs) > 0:
-        start_idx = 0
-        end_idx = troughs[0]
+    for i in range(len(troughs)):
+        if i == 0:
+            # Primeiro ciclo: do início até o primeiro vale
+            start_idx = 0
+            end_idx = troughs[i]
+        else:
+            # Ciclos posteriores: do vale anterior ao próximo vale
+            start_idx = troughs[i - 1]
+            end_idx = troughs[i]
         
         cycle_length_days = (dates[end_idx] - dates[start_idx]) / np.timedelta64(1, 'D')
         
+        # Apenas adiciona ciclos que têm comprimento mínimo aceitável
         if cycle_length_days >= min_cycle_length_days:
             cycles.append({
                 'cycle_num': len(cycles) + 1,
@@ -261,45 +226,18 @@ def segment_cycles(ndvi_values: np.ndarray, dates: np.ndarray, troughs: np.ndarr
                 'length_days': cycle_length_days,
                 'min_ndvi': np.min(ndvi_values[start_idx:end_idx + 1]),
                 'max_ndvi': np.max(ndvi_values[start_idx:end_idx + 1]),
-                'trough_idx': -1,
-                'trough_ndvi': np.nan,
+                'trough_idx': int(troughs[i]) if i > 0 else -1,
+                'trough_ndvi': ndvi_values[troughs[i]] if i > 0 else np.nan,
             })
     
-    # Ciclos intermediários: cada um vai de um vale ao próximo
-    for i in range(len(troughs) - 1):
-        start_idx = troughs[i]
-        end_idx = troughs[i + 1]
-        
-        cycle_length_days = (dates[end_idx] - dates[start_idx]) / np.timedelta64(1, 'D')
-        
-        # MUDANÇA IMPORTANTE: Reduzido threshold mínimo de ciclo
-        # Antes: respeitava min_cycle_length_days
-        # Agora: aceita ciclos com até 25 dias (típico de safrinha)
-        min_cycle_short = min_cycle_length_days * 0.55  # Permite ciclos 45% mais curtos
-        
-        if cycle_length_days >= min_cycle_short:
-            cycles.append({
-                'cycle_num': len(cycles) + 1,
-                'start_idx': int(start_idx),
-                'end_idx': int(end_idx),
-                'start_date': pd.Timestamp(dates[start_idx]),
-                'end_date': pd.Timestamp(dates[end_idx]),
-                'length_days': cycle_length_days,
-                'min_ndvi': np.min(ndvi_values[start_idx:end_idx + 1]),
-                'max_ndvi': np.max(ndvi_values[start_idx:end_idx + 1]),
-                'trough_idx': int(troughs[i + 1]),
-                'trough_ndvi': ndvi_values[troughs[i + 1]],
-            })
-    
-    # Ciclo final: do último vale até o fim
+    # Adiciona ciclo final: do último vale até o fim
     if len(troughs) > 0:
         start_idx = troughs[-1]
         end_idx = len(ndvi_values) - 1
         
         cycle_length_days = (dates[end_idx] - dates[start_idx]) / np.timedelta64(1, 'D')
-        min_cycle_short = min_cycle_length_days * 0.55
         
-        if cycle_length_days >= min_cycle_short:
+        if cycle_length_days >= min_cycle_length_days:
             cycles.append({
                 'cycle_num': len(cycles) + 1,
                 'start_idx': int(start_idx),
@@ -463,7 +401,6 @@ def extract_phenometrics(df_ts: pd.DataFrame, ndvi_column: str = 'NDVI_mean',
     """
     Extrai métricas fenológicas completas usando nova metodologia v2.
     Otimizada para detectar múltiplas safras (safra e safrinha).
-    AGORA COM MELHOR SUPORTE A SAFRA/SAFRINHA E CICLOS CURTOS.
     
     Args:
         df_ts: DataFrame com série temporal (deve ter 'datetime' e coluna NDVI)
@@ -517,24 +454,10 @@ def extract_phenometrics(df_ts: pd.DataFrame, ndvi_column: str = 'NDVI_mean',
                            min_cycle_length_days=min_cycle_length_days)
     
     # Etapa 4: Fit de gaussiana em cada ciclo
-    # MUDANÇA: Usa quality threshold adaptativo baseado no comprimento do ciclo
     fitted_cycles = []
     for cycle in cycles:
-        # Para ciclos curtos (safrinha), permite R² um pouco mais baixo
-        # Ciclo curto (< 100 dias): R² mín = 0.50
-        # Ciclo médio (100-150 dias): R² mín = 0.55
-        # Ciclo longo (> 150 dias): R² mín = 0.60
-        
-        cycle_length = cycle['length_days']
-        if cycle_length < 100:
-            adjusted_threshold = min(quality_threshold, 0.50)
-        elif cycle_length < 150:
-            adjusted_threshold = min(quality_threshold, 0.55)
-        else:
-            adjusted_threshold = quality_threshold
-        
         result = fit_gaussian_to_cycle(ndvi_values, dates, cycle, 
-                                      quality_threshold=adjusted_threshold)
+                                      quality_threshold=quality_threshold)
         fitted_cycles.append(result)
     
     # Extrai estatísticas
