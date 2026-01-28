@@ -110,6 +110,43 @@ import matplotlib.pyplot as plt
 import numpy as np
 from IPython.display import display, Markdown
 import json
+import locale
+
+# Configurar locale para pt_BR
+try:
+    locale.setlocale(locale.LC_ALL, 'pt_BR.UTF-8')
+except:
+    try:
+        locale.setlocale(locale.LC_ALL, 'pt_BR')
+    except:
+        pass
+
+def format_number_br(value, decimals=2, unit=""):
+    """
+    Formata um número para o padrão brasileiro (ponto para milhar, vírgula para decimal).
+    """
+    if pd.isna(value) or value is None:
+        return "N/A"
+    try:
+        value_float = float(value)
+        # Formata com a quantidade correta de decimais
+        formatted = locale.format_string(f"%.{decimals}f", value_float, grouping=True)
+        # Se não tiver locale pt_BR, fazer manualmente
+        if ',' not in formatted and '.' in formatted:
+            # Está usando formato padrão americano, converter
+            parts = formatted.split('.')
+            if len(parts) == 2 and len(parts[1]) == decimals:
+                formatted = f"{parts[0].replace('.', ',')}".replace(',', '.')  # Remove mil separators
+                # Adiciona novamente com vírgula
+                if int(parts[0]) >= 1000:
+                    formatted = f"{int(parts[0]):,}".replace(',', '.') + ',' + parts[1]
+                else:
+                    formatted = f"{parts[0]},{parts[1]}"
+        if unit:
+            formatted = f"{formatted} {unit}"
+        return formatted
+    except:
+        return str(value) + (f" {unit}" if unit else "")
 
 def plot_df_as_table(df, title="", col_widths=None, is_kv_style=False, fig_height_scale=0.5, font_size=10, zebra_stripe=True, bold_first_col=False):
     """
@@ -176,11 +213,35 @@ def _find_text(element, path, ns, default="N/A"):
     """
     Helper function to find text in an XML element.
     Returns 'default' (N/A) if not found.
+    Trata exceções de parsing para campos de data preenchidos.
     """
     if element is None:
         return default
-    node = element.find(path, ns)
-    return node.text.strip() if node is not None and node.text else default
+    try:
+        node = element.find(path, ns)
+        if node is not None and node.text:
+            text = node.text.strip()
+            # Validação adicional para campos de data
+            if path.endswith(('DtPlntAo', 'Dt', 'Data')) and text:
+                # Tenta validar formato de data
+                try:
+                    from datetime import datetime
+                    # Tenta vários formatos
+                    for fmt in ['%Y-%m-%d', '%d/%m/%Y', '%Y%m%d']:
+                        try:
+                            datetime.strptime(text, fmt)
+                            return text
+                        except ValueError:
+                            continue
+                    # Se nenhum formato funcionou, retorna o texto original
+                    return text
+                except Exception:
+                    return text
+            return text
+        return default
+    except Exception as e:
+        print_status(f"Aviso: Erro ao buscar {path}: {e}")
+        return default
 
 def parse_xml_to_gdf_all_fields(xml_string):
     """
@@ -256,6 +317,7 @@ def parse_xml_to_gdf_all_fields(xml_string):
             "VlrReceitaBrutEsprdEmpnmnt": _find_text(dest_elem, 'ns:VlrReceitaBrutEsprdEmpnmnt', ns),
             "DtIniPlant": _find_text(dest_elem, 'ns:DtIniPlant', ns),
             "DtFimPlant": _find_text(dest_elem, 'ns:DtFimPlant', ns),
+            "DtPlntAo": _find_text(dest_elem, 'ns:DtPlntAo', ns),  # Campo de data de plantio adicional
             "DtIniColht": _find_text(dest_elem, 'ns:DtIniColht', ns),
             "DtFimColht": _find_text(dest_elem, 'ns:DtFimColht', ns),
         }
@@ -943,13 +1005,52 @@ def apply_scl_mask(scl_arr, target_shape, scl_transform, scl_crs, ref_transform,
     mask_clouds = np.isin(scl_resampled, cloud_classes)
     return mask_clouds
 
-def aplicar_contraste_raiz(array, L, N):
-    return np.power(array / L, 1/N) * L
+def normalize_band_rgb(band, percentile_low=2, percentile_high=98):
+    """
+    Pipeline profissional de normalização para bandas RGB do Sentinel-2.
+    Segue o padrão GDAL/QGIS para melhor contraste.
+    
+    Args:
+        band: Array 2D da banda bruta (valores 0-10000 típicos do Sentinel-2)
+        percentile_low: Percentil inferior (padrão 2%)
+        percentile_high: Percentil superior (padrão 98%)
+    
+    Returns:
+        Array normalizado em [0, 1] com contraste otimizado
+    """
+    # Remove NaNs temporariamente para cálculos
+    valid_pixels = band[~np.isnan(band)]
+    
+    if len(valid_pixels) == 0:
+        return np.zeros_like(band)
+    
+    # Calcula limites baseados em percentis (melhor que min/max)
+    vmin = np.percentile(valid_pixels, percentile_low)
+    vmax = np.percentile(valid_pixels, percentile_high)
+    
+    # Evita divisão por zero
+    if vmax <= vmin:
+        vmax = vmin + 1
+    
+    # Normalização linear agressiva [vmin, vmax] -> [0, 1]
+    normalized = np.clip((band - vmin) / (vmax - vmin), 0, 1)
+    
+    return normalized
 
-def normalizar(array, L):
-    arr_min, arr_max = np.nanmin(array), np.nanmax(array)
-    if arr_max - arr_min == 0: return np.zeros_like(array)
-    return (array - arr_min) / (arr_max - arr_min) * L
+def enhance_rgb_contrast(rgb_array, power=1.3):
+    """
+    Melhora o contraste da imagem RGB via gamma correction.
+    Deixa a imagem mais "viva" sem saturação.
+    
+    Args:
+        rgb_array: Array 3D (height, width, 3) com valores em [0, 1]
+        power: Expoente de gamma (>1 = mais brilho, <1 = mais escuro)
+    
+    Returns:
+        Array RGB com contraste melhorado
+    """
+    # Gamma correction: output = input^(1/gamma)
+    return np.power(rgb_array, 1.0 / power)
 
 def merge_assets_by_date(time_ordered_items, gleba_geo):
     G, C1, C2, L_evi, SCALE_FACTOR = 2.5, 6.0, 7.5, 1.0, 10000.0
@@ -1021,15 +1122,25 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
         b08_m = mask_to_nan(b08)
         b11_m = mask_to_nan(b11) if b11 is not None else None
 
-        # Build RGB matrix (channels: R=NIR(B08), G=B11 (resampled), B=B04)
-        L, N = 2**12, 2
-        matriz_rgb = np.zeros((ref_shape[0], ref_shape[1], 3), dtype=np.float32)
-        matriz_rgb[:, :, 0] = aplicar_contraste_raiz(normalizar(b08_m, L), L, N) / L if b08_m is not None else np.zeros(ref_shape, dtype=np.float32)
-        if b11_m is not None:
-            matriz_rgb[:, :, 1] = aplicar_contraste_raiz(normalizar(b11_m, L), L, N) / L
-        else:
-            matriz_rgb[:, :, 1] = np.zeros(ref_shape, dtype=np.float32)
-        matriz_rgb[:, :, 2] = aplicar_contraste_raiz(normalizar(b04_m, L), L, N) / L if b04_m is not None else np.zeros(ref_shape, dtype=np.float32)
+        # --- NOVO PIPELINE RGB PROFISSIONAL ---
+        # Construct RGB: R=B04(Red), G=B08(NIR), B=B02(Blue)
+        # Isso cria uma composição "false color" (infrared red composite)
+        # que destaca muito bem a vegetação
+        
+        # Normaliza cada banda individualmente com clipping por percentil
+        r_band = normalize_band_rgb(b04_m, percentile_low=2, percentile_high=98)
+        g_band = normalize_band_rgb(b08_m, percentile_low=2, percentile_high=98)
+        b_band = normalize_band_rgb(b02_m, percentile_low=2, percentile_high=98)
+        
+        # Stack nas 3 camadas
+        matriz_rgb = np.stack([r_band, g_band, b_band], axis=2)
+        
+        # Aplicar gamma correction para melhorar o contraste e vida das cores
+        # power=1.3 significa brightening suave (deixa mais vivo)
+        matriz_rgb = enhance_rgb_contrast(matriz_rgb, power=1.3)
+        
+        # Ensure final clipping just to be safe
+        matriz_rgb = np.clip(matriz_rgb, 0, 1).astype(np.float32)
 
         # Compute EVI
         refl_02 = b02_m.astype(np.float32) / SCALE_FACTOR
@@ -1043,7 +1154,7 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
     return merged_assets
 
 
-def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harvesting_period=None):
+def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harvesting_period=None, num_cycles_to_annotate=2, min_cycle_duration_days=100):
     """
     Busca e plota a série temporal média de 6 anos para a gleba inteira
     usando a função summarize (geom=) do WTSS e adiciona SOS, POS e EOS.
@@ -1053,6 +1164,8 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
         gleba_id (str): O ID da gleba para o título.
         planting_period (tuple, optional): Tupla com (start_date, end_date) do plantio.
         harvesting_period (tuple, optional): Tupla com (start_date, end_date) da colheita.
+        num_cycles_to_annotate (int, optional): Número de ciclos (mais recentes) para mostrar anotações. Padrão: 2.
+        min_cycle_duration_days (int, optional): Duração mínima (em dias) do ciclo para ser plotado. Ciclos incompletos são excluídos. Padrão: 100.
     """
     # Inicializar o cubo WTSS
     bdc_wtss_link = 'https://data.inpe.br/bdc/wtss/v4/'
@@ -1060,9 +1173,9 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
     servico_wtss = wtss.WTSS(bdc_wtss_link)
     cubo = servico_wtss[colecao_modis]
 
-    print_status("   - Definindo período de 6 anos para série temporal média (WTSS)...")
+    print_status("   - Definindo período de 5 anos para série temporal média (WTSS)...")
     end_date_dt = datetime.now()
-    start_date_dt = end_date_dt - relativedelta(years=6)
+    start_date_dt = end_date_dt - relativedelta(years=5)
     start_date_str = start_date_dt.strftime('%Y-%m-%d')
 
     start_date_pheno_dt = end_date_dt - relativedelta(years=1)
@@ -1154,7 +1267,21 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
         if successful_cycles:
             colors_cycle = ['blue', 'red', 'purple', 'green', 'orange', 'brown']
             
-            for idx, cycle in enumerate(successful_cycles):
+            # Filtra ciclos com duração mínima para evitar ciclos incompletos
+            filtered_cycles = []
+            for cycle in successful_cycles:
+                sos = pd.to_datetime(cycle['phenophase_dates']['sos'])
+                eos = pd.to_datetime(cycle['phenophase_dates']['eos'])
+                cycle_duration = (eos - sos).days
+                if cycle_duration >= min_cycle_duration_days:
+                    filtered_cycles.append(cycle)
+            
+            # Ordena ciclos por data (mais recentes primeiro) e seleciona apenas os desejados
+            successful_cycles_sorted = sorted(filtered_cycles, key=lambda c: c['phenophase_dates']['pos'], reverse=True)
+            cycles_to_plot = successful_cycles_sorted[:num_cycles_to_annotate]
+            
+            # Plota linhas verticais e anotações apenas para os ciclos selecionados
+            for idx, cycle in enumerate(cycles_to_plot):
                 color_base = colors_cycle[idx % len(colors_cycle)]
                 phenophase = cycle['phenophase_dates']
                 
@@ -1163,12 +1290,28 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
                 ax.axvline(phenophase['pos'], color=color_base, linestyle='-', alpha=0.7, linewidth=2)
                 ax.axvline(phenophase['eos'], color=color_base, linestyle='--', alpha=0.6, linewidth=1.5)
                 
-                # Anotações para primeiros ciclos
-                if idx < 2:
-                    ax.annotate(f'C{idx+1}', 
-                               xy=(phenophase['pos'], ax.get_ylim()[1] * 0.85), 
-                               xytext=(0, -5), textcoords='offset points', 
-                               ha='center', va='top', fontsize=8, color=color_base, fontweight='bold')
+                # Anotações com data para SOS, POS e EOS em y=0
+                sos_date = pd.to_datetime(phenophase['sos']).strftime('%d/%m/%Y')
+                pos_date = pd.to_datetime(phenophase['pos']).strftime('%d/%m/%Y')
+                eos_date = pd.to_datetime(phenophase['eos']).strftime('%d/%m/%Y')
+                
+                ax.annotate(f'SOS: {sos_date}', 
+                           xy=(phenophase['sos'], 0.0),
+                           xytext=(-5, -5), textcoords='offset points',
+                           ha='right', va='top', fontsize=9, color=color_base, fontweight='bold',
+                           rotation=45)
+                
+                ax.annotate(f'POS: {pos_date}', 
+                           xy=(phenophase['pos'], 0.0),
+                           xytext=(-5, -5), textcoords='offset points',
+                           ha='right', va='top', fontsize=9, color=color_base, fontweight='bold',
+                           rotation=45)
+                
+                ax.annotate(f'EOS: {eos_date}', 
+                           xy=(phenophase['eos'], 0.0),
+                           xytext=(-5, -5), textcoords='offset points',
+                           ha='right', va='top', fontsize=9, color=color_base, fontweight='bold',
+                           rotation=45)
             
             print_status(f"   - Ciclos detectados: {phenometrics['num_cycles_detected']}")
             print_status(f"   - Ajustes bem-sucedidos: {phenometrics['num_successful_fits']}")
@@ -1182,7 +1325,7 @@ def get_and_plot_areal_ts_wtss(gleba_4326, gleba_id, planting_period=None, harve
     ax.legend(by_label.values(), by_label.keys(), loc='upper left')
 
     # Ajustes de estilo
-    ax.set_title(f'Série Temporal Média de NDVI (Últimos 6 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
+    ax.set_title(f'Série Temporal Média de NDVI (Últimos 5 anos) - Gleba {gleba_id}', loc='left', fontsize=14, fontweight='bold')
     ax.set_xlabel('Data', fontsize=10)
     ax.set_ylabel('NDVI Médio', fontsize=10)
     ax.set_ylim(0.0, 1.0)
@@ -1494,8 +1637,8 @@ def processar_gleba(
 
                     # RGB (left)
                     if assets.get('rgb') is not None:
-                        ax_rgb.imshow(np.clip(assets['rgb'] / 1.5, 0, 1))
-                        ax_rgb.set_title(f"{date} (RGB)")
+                        ax_rgb.imshow(np.clip(assets['rgb'], 0, 1))
+                        ax_rgb.set_title(f"{date} (RGB - False Color)")
                     else:
                         ax_rgb.text(0.5, 0.5, 'RGB Erro', ha='center', va='center')
                         ax_rgb.set_title(f"{date} (RGB)")
@@ -1601,8 +1744,11 @@ except Exception as e:
 if xml_content:
     try:
         gdf = parse_xml_to_gdf_all_fields(xml_content)
+        print_status(f"XML parseado com sucesso. {len(gdf)} registros carregados.")
     except Exception as e:
         print_status(f"ERRO ao parsear o XML para GeoDataFrame: {e}")
+        import traceback
+        print_status(f"Traceback: {traceback.format_exc()}")
         gdf = None
 else:
     gdf = None
@@ -1642,13 +1788,21 @@ if coerced_receita.isna().all():
 else:
     receita_esperada = f"{coerced_receita.fillna(0).sum():,.2f}"
 
+# Cálculo do volume total da operação (VlrTotOp)
+coerced_vlr_tot_op = pd.to_numeric(gdf['VlrTotOp'], errors='coerce')
+if coerced_vlr_tot_op.isna().all():
+    volume_total = 'N/A'
+else:
+    volume_total = f"R$ {coerced_vlr_tot_op.fillna(0).sum():,.2f}"
+
 dados_cadastrais = {
     'Instituição Financeira:': 'BOCOM BBM',
     'Produtor:': produtor,
     'CPF / CNPJ:': cnpj_cpf,
     'REFBACEN:': ref_bacen,
-    'Área Financiada (ha):': 'N/A' if pd.isna(area_ha) or area_ha <= 0 else f"{area_ha:,.2f}",
+    'Área Financiada (ha):': 'N/A' if pd.isna(area_ha) or area_ha <= 0 else f"{area_ha:,.2f} ha",
     'Receita esperada (BRL):': receita_esperada,
+    'Volume Total da Operação:': volume_total,
     'Data de Emissão:': gdf['DtEms'][0] 
 }
 
