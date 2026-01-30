@@ -1037,17 +1037,17 @@ def normalize_band_rgb(band, percentile_low=2, percentile_high=98):
     
     return normalized
 
-def enhance_rgb_contrast(rgb_array, power=1.3):
+def enhance_rgb_contrast(rgb_array, power=1.01):
     """
-    Melhora o contraste da imagem RGB via gamma correction.
-    Deixa a imagem mais "viva" sem saturação.
+    Melhora o contraste da imagem RGB via gamma correction mínima.
+    Praticamente sem alteração para manter cores naturais.
     
     Args:
         rgb_array: Array 3D (height, width, 3) com valores em [0, 1]
-        power: Expoente de gamma (>1 = mais brilho, <1 = mais escuro)
+        power: Expoente de gamma (1.01 = quase nenhum efeito, 1.0 = identidade)
     
     Returns:
-        Array RGB com contraste melhorado
+        Array RGB com contraste praticamente inalterado
     """
     # Gamma correction: output = input^(1/gamma)
     return np.power(rgb_array, 1.0 / power)
@@ -1063,6 +1063,7 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
     for date, items_on_date in grouped_items.items():
         # Merge bands across items for this date
         b02, t02, crs02 = merge_band_for_date(items_on_date, 'B02', gleba_geo)
+        b03, t03, crs03 = merge_band_for_date(items_on_date, 'B03', gleba_geo)
         b04, t04, crs04 = merge_band_for_date(items_on_date, 'B04', gleba_geo)
         b08, t08, crs08 = merge_band_for_date(items_on_date, 'B08', gleba_geo)
         b11, t11, crs11 = merge_band_for_date(items_on_date, 'B11', gleba_geo)
@@ -1085,6 +1086,12 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
             continue
         if not (np.allclose(t04.to_gdal(), ref_transform.to_gdal()) if hasattr(t04, 'to_gdal') else True):
             b04 = reproject_to_target(b04, t04, crs04, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)
+
+        if t03 is None:
+            print_status(f"B03 missing for date {date}")
+            continue
+        if not (np.allclose(t03.to_gdal(), ref_transform.to_gdal()) if hasattr(t03, 'to_gdal') else True):
+            b03 = reproject_to_target(b03, t03, crs03, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)
 
         if t08 is None:
             print_status(f"B08 missing for date {date}")
@@ -1118,26 +1125,27 @@ def merge_assets_by_date(time_ordered_items, gleba_geo):
             return arr
 
         b02_m = mask_to_nan(b02)
+        b03_m = mask_to_nan(b03)
         b04_m = mask_to_nan(b04)
         b08_m = mask_to_nan(b08)
         b11_m = mask_to_nan(b11) if b11 is not None else None
 
         # --- NOVO PIPELINE RGB PROFISSIONAL ---
-        # Construct RGB: R=B04(Red), G=B08(NIR), B=B02(Blue)
-        # Isso cria uma composição "false color" (infrared red composite)
-        # que destaca muito bem a vegetação
+        # Construct RGB: R=B04(Red), G=B03(Green), B=B02(Blue)
+        # Isso cria uma composição RGB NATURAL (cores reais da fotografia)
+        # evitando tons artificiais de roxo/magenta em solo seco
         
         # Normaliza cada banda individualmente com clipping por percentil
         r_band = normalize_band_rgb(b04_m, percentile_low=2, percentile_high=98)
-        g_band = normalize_band_rgb(b08_m, percentile_low=2, percentile_high=98)
+        g_band = normalize_band_rgb(b03_m, percentile_low=2, percentile_high=98)  # Banda verde (B03)
         b_band = normalize_band_rgb(b02_m, percentile_low=2, percentile_high=98)
         
         # Stack nas 3 camadas
         matriz_rgb = np.stack([r_band, g_band, b_band], axis=2)
         
-        # Aplicar gamma correction para melhorar o contraste e vida das cores
-        # power=1.3 significa brightening suave (deixa mais vivo)
-        matriz_rgb = enhance_rgb_contrast(matriz_rgb, power=1.3)
+        # Aplicar gamma correction MÍNIMA para manter cores naturais fotográficas
+        # power=1.01 significa quase nenhum brightening (cores reais da cena)
+        matriz_rgb = enhance_rgb_contrast(matriz_rgb, power=1.01)
         
         # Ensure final clipping just to be safe
         matriz_rgb = np.clip(matriz_rgb, 0, 1).astype(np.float32)
@@ -1495,11 +1503,6 @@ def processar_gleba(
         start_date = gleba_data['DtEms'].strftime('%Y-%m-%d')
         end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')
         dates_available = False
-
-
-    start_date = gleba_data['DtEms'].strftime('%Y-%m-%d')
-    end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')
-    dates_available = False
 
     # Se as datas necessárias estiverem ausentes, pular esta etapa para evitar erros
     if dates_available and pd.notna(gleba_data.get('DtFimPlant')) and pd.notna(gleba_data.get('DtIniColht')):
@@ -1988,9 +1991,7 @@ for i, dest_row in gdf.iterrows():
 
 .
 
-.
-
-**Assinatura do Responsável pelo Laudo**
+**Assinatura do Responsável pelo Laudo:**
 
 ---
 

@@ -20,7 +20,7 @@
         "  ref_bacen: \"513438999\"\n",
         "---\n"
       ],
-      "id": "0631b83e"
+      "id": "a2e00a78"
     },
     {
       "cell_type": "code",
@@ -35,7 +35,7 @@
         "produtor = \"Monte Alegre\"\n",
         "ref_bacen = \"20250862734\""
       ],
-      "id": "16d9fc91",
+      "id": "42c46b13",
       "execution_count": null,
       "outputs": []
     },
@@ -1056,17 +1056,17 @@
         "    \n",
         "    return normalized\n",
         "\n",
-        "def enhance_rgb_contrast(rgb_array, power=1.3):\n",
+        "def enhance_rgb_contrast(rgb_array, power=1.01):\n",
         "    \"\"\"\n",
-        "    Melhora o contraste da imagem RGB via gamma correction.\n",
-        "    Deixa a imagem mais \"viva\" sem saturação.\n",
+        "    Melhora o contraste da imagem RGB via gamma correction mínima.\n",
+        "    Praticamente sem alteração para manter cores naturais.\n",
         "    \n",
         "    Args:\n",
         "        rgb_array: Array 3D (height, width, 3) com valores em [0, 1]\n",
-        "        power: Expoente de gamma (>1 = mais brilho, <1 = mais escuro)\n",
+        "        power: Expoente de gamma (1.01 = quase nenhum efeito, 1.0 = identidade)\n",
         "    \n",
         "    Returns:\n",
-        "        Array RGB com contraste melhorado\n",
+        "        Array RGB com contraste praticamente inalterado\n",
         "    \"\"\"\n",
         "    # Gamma correction: output = input^(1/gamma)\n",
         "    return np.power(rgb_array, 1.0 / power)\n",
@@ -1082,6 +1082,7 @@
         "    for date, items_on_date in grouped_items.items():\n",
         "        # Merge bands across items for this date\n",
         "        b02, t02, crs02 = merge_band_for_date(items_on_date, 'B02', gleba_geo)\n",
+        "        b03, t03, crs03 = merge_band_for_date(items_on_date, 'B03', gleba_geo)\n",
         "        b04, t04, crs04 = merge_band_for_date(items_on_date, 'B04', gleba_geo)\n",
         "        b08, t08, crs08 = merge_band_for_date(items_on_date, 'B08', gleba_geo)\n",
         "        b11, t11, crs11 = merge_band_for_date(items_on_date, 'B11', gleba_geo)\n",
@@ -1104,6 +1105,12 @@
         "            continue\n",
         "        if not (np.allclose(t04.to_gdal(), ref_transform.to_gdal()) if hasattr(t04, 'to_gdal') else True):\n",
         "            b04 = reproject_to_target(b04, t04, crs04, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)\n",
+        "\n",
+        "        if t03 is None:\n",
+        "            print_status(f\"B03 missing for date {date}\")\n",
+        "            continue\n",
+        "        if not (np.allclose(t03.to_gdal(), ref_transform.to_gdal()) if hasattr(t03, 'to_gdal') else True):\n",
+        "            b03 = reproject_to_target(b03, t03, crs03, ref_shape, ref_transform, ref_crs, resampling=Resampling.bilinear)\n",
         "\n",
         "        if t08 is None:\n",
         "            print_status(f\"B08 missing for date {date}\")\n",
@@ -1137,26 +1144,27 @@
         "            return arr\n",
         "\n",
         "        b02_m = mask_to_nan(b02)\n",
+        "        b03_m = mask_to_nan(b03)\n",
         "        b04_m = mask_to_nan(b04)\n",
         "        b08_m = mask_to_nan(b08)\n",
         "        b11_m = mask_to_nan(b11) if b11 is not None else None\n",
         "\n",
         "        # --- NOVO PIPELINE RGB PROFISSIONAL ---\n",
-        "        # Construct RGB: R=B04(Red), G=B08(NIR), B=B02(Blue)\n",
-        "        # Isso cria uma composição \"false color\" (infrared red composite)\n",
-        "        # que destaca muito bem a vegetação\n",
+        "        # Construct RGB: R=B04(Red), G=B03(Green), B=B02(Blue)\n",
+        "        # Isso cria uma composição RGB NATURAL (cores reais da fotografia)\n",
+        "        # evitando tons artificiais de roxo/magenta em solo seco\n",
         "        \n",
         "        # Normaliza cada banda individualmente com clipping por percentil\n",
         "        r_band = normalize_band_rgb(b04_m, percentile_low=2, percentile_high=98)\n",
-        "        g_band = normalize_band_rgb(b08_m, percentile_low=2, percentile_high=98)\n",
+        "        g_band = normalize_band_rgb(b03_m, percentile_low=2, percentile_high=98)  # Banda verde (B03)\n",
         "        b_band = normalize_band_rgb(b02_m, percentile_low=2, percentile_high=98)\n",
         "        \n",
         "        # Stack nas 3 camadas\n",
         "        matriz_rgb = np.stack([r_band, g_band, b_band], axis=2)\n",
         "        \n",
-        "        # Aplicar gamma correction para melhorar o contraste e vida das cores\n",
-        "        # power=1.3 significa brightening suave (deixa mais vivo)\n",
-        "        matriz_rgb = enhance_rgb_contrast(matriz_rgb, power=1.3)\n",
+        "        # Aplicar gamma correction MÍNIMA para manter cores naturais fotográficas\n",
+        "        # power=1.01 significa quase nenhum brightening (cores reais da cena)\n",
+        "        matriz_rgb = enhance_rgb_contrast(matriz_rgb, power=1.01)\n",
         "        \n",
         "        # Ensure final clipping just to be safe\n",
         "        matriz_rgb = np.clip(matriz_rgb, 0, 1).astype(np.float32)\n",
@@ -1515,11 +1523,6 @@
         "        end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')\n",
         "        dates_available = False\n",
         "\n",
-        "\n",
-        "    start_date = gleba_data['DtEms'].strftime('%Y-%m-%d')\n",
-        "    end_date = (gleba_data['DtEms']+relativedelta(years=1)).strftime('%Y-%m-%d')\n",
-        "    dates_available = False\n",
-        "\n",
         "    # Se as datas necessárias estiverem ausentes, pular esta etapa para evitar erros\n",
         "    if dates_available and pd.notna(gleba_data.get('DtFimPlant')) and pd.notna(gleba_data.get('DtIniColht')):\n",
         "        # gleba_4326 (geometria) e cubo_modis (objeto wtss) já estão definidos\n",
@@ -1738,7 +1741,7 @@
         "        else:\n",
         "            print_status(\"   - AVISO: Não há dados suficientes no cubo para a análise SOM. A análise foi pulada.\")\n"
       ],
-      "id": "c73a8d1a",
+      "id": "466f06c3",
       "execution_count": null,
       "outputs": []
     },
@@ -1781,7 +1784,7 @@
         "    # Interrompe a execução do Quarto aqui, se possível (em um script normal, usaríamos sys.exit)\n",
         "    raise SystemExit(\"Parando a execução devido à falha no carregamento dos dados.\")"
       ],
-      "id": "fe4c5a5c",
+      "id": "920dd959",
       "execution_count": null,
       "outputs": []
     },
@@ -1791,7 +1794,7 @@
       "source": [
         "## Dados Cadastrais"
       ],
-      "id": "83dbba47"
+      "id": "77f0b32e"
     },
     {
       "cell_type": "code",
@@ -1844,7 +1847,7 @@
         "\n",
         "plot_df_as_table(df, col_widths=[0.4, 0.6], is_kv_style=True)"
       ],
-      "id": "c8bcd4a3",
+      "id": "e36cf528",
       "execution_count": null,
       "outputs": []
     },
@@ -1854,7 +1857,7 @@
       "source": [
         "## Imóveis Associados"
       ],
-      "id": "be1b72e1"
+      "id": "441bc72f"
     },
     {
       "cell_type": "code",
@@ -1888,7 +1891,7 @@
         "else:\n",
         "    display(Markdown(\"Nenhum imóvel associado encontrado.\"))"
       ],
-      "id": "e268b558",
+      "id": "da74eb57",
       "execution_count": null,
       "outputs": []
     },
@@ -1932,7 +1935,7 @@
         "fig_localization = plot_rural_property(joined, municipalities_gdf=municipio_filtrado)\n",
         "plt.show()\n"
       ],
-      "id": "3e3ac22d",
+      "id": "a6e91c06",
       "execution_count": null,
       "outputs": []
     },
@@ -1944,7 +1947,7 @@
         "\n",
         "# Detalhes por Empreendimento"
       ],
-      "id": "635ad354"
+      "id": "83106fbe"
     },
     {
       "cell_type": "code",
@@ -2050,9 +2053,7 @@
         "\n",
         ".\n",
         "\n",
-        ".\n",
-        "\n",
-        "**Assinatura do Responsável pelo Laudo**\n",
+        "**Assinatura do Responsável pelo Laudo:**\n",
         "\n",
         "---\n",
         "\n",
@@ -2086,7 +2087,7 @@
         "        #break\n",
         "    #break\n"
       ],
-      "id": "6317bdb0",
+      "id": "3f197206",
       "execution_count": null,
       "outputs": []
     },
@@ -2168,7 +2169,7 @@
         "\n",
         "## Anexos"
       ],
-      "id": "eaea7fb6"
+      "id": "1b4435af"
     },
     {
       "cell_type": "code",
@@ -2234,7 +2235,7 @@
         "        #break\n",
         "    #break\n"
       ],
-      "id": "2f1bae5d",
+      "id": "f61b0eb5",
       "execution_count": null,
       "outputs": []
     }
